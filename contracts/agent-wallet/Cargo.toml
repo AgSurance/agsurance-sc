@@ -1,0 +1,11 @@
+[package]
+name = "agent-wallet"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk.workspace = true
