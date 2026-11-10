@@ -1,9 +1,10 @@
 use near_sdk::{
     env, near, AccountId, Allowance, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
-    PublicKey,
+    PromiseOrValue, PublicKey,
 };
 
 const PREMIUM: NearToken = NearToken::from_millinear(10);
+const WALLET_FUNDING: NearToken = NearToken::from_millinear(300);
 const LIMIT: NearToken = NearToken::from_millinear(400);
 const AGENT_FUNDING: NearToken = NearToken::from_millinear(100);
 const DEDUCTIBLE: NearToken = NearToken::from_millinear(50);
@@ -46,6 +47,21 @@ struct Agent {
     connected: bool,
 }
 
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckoutPhase {
+    Funding,
+    Refunding,
+    RefundAvailable,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone)]
+struct Checkout {
+    policy_id: u32,
+    phase: CheckoutPhase,
+}
+
 #[near(serializers = [json])]
 pub struct Dashboard {
     reserve: NearToken,
@@ -58,6 +74,8 @@ pub struct Dashboard {
     owner: AccountId,
     agent: Option<Agent>,
     agent_funding: NearToken,
+    wallet_funding: NearToken,
+    checkout: Option<Checkout>,
 }
 
 #[near(contract_state)]
@@ -71,6 +89,7 @@ pub struct CoverageVault {
     policy: Option<Policy>,
     agent: Option<Agent>,
     agent_sequence: u32,
+    checkout: Option<Checkout>,
 }
 
 #[near]
@@ -105,6 +124,7 @@ impl CoverageVault {
             policy: None,
             agent: None,
             agent_sequence: 0,
+            checkout: None,
         }
     }
 
@@ -113,7 +133,12 @@ impl CoverageVault {
     }
 
     pub fn dashboard(&self) -> Dashboard {
-        let reserved = if self.policy.as_ref().is_some_and(|p| p.phase != Phase::Paid) {
+        let reserved = if self.policy.as_ref().is_some_and(|p| p.phase != Phase::Paid)
+            || self
+                .checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.phase == CheckoutPhase::Funding)
+        {
             LIMIT
         } else {
             NearToken::from_yoctonear(0)
@@ -129,6 +154,8 @@ impl CoverageVault {
             owner: self.owner.clone(),
             agent: self.agent.clone(),
             agent_funding: AGENT_FUNDING,
+            wallet_funding: WALLET_FUNDING,
+            checkout: self.checkout.clone(),
         }
     }
 
@@ -141,28 +168,107 @@ impl CoverageVault {
     }
 
     #[payable]
-    pub fn buy_policy(&mut self) -> u32 {
+    pub fn buy_policy(&mut self) -> Promise {
         assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
+        assert!(self.checkout.is_none(), "Checkout already pending");
         assert!(
             self.policy.as_ref().is_none_or(|p| p.phase == Phase::Paid),
             "Policy already active"
         );
-        assert!(env::attached_deposit() == PREMIUM, "Incorrect premium");
+        assert_eq!(
+            env::attached_deposit(),
+            Self::checkout_total(),
+            "Incorrect checkout amount"
+        );
         assert!(self.reserve >= LIMIT, "Reserve capacity unavailable");
         let id = self
             .policy
             .as_ref()
             .map_or(1, |p| p.id.checked_add(1).expect("Policy ID overflow"));
+        self.checkout = Some(Checkout {
+            policy_id: id,
+            phase: CheckoutPhase::Funding,
+        });
+        Promise::new(self.wallet.clone())
+            .function_call(
+                "fund_checkout",
+                near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({ "policy_id": id }))
+                    .expect("Policy ID"),
+                WALLET_FUNDING,
+                Gas::from_tgas(12),
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(35))
+                    .finish_checkout(),
+            )
+    }
+
+    #[private]
+    pub fn finish_checkout(&mut self) -> PromiseOrValue<bool> {
+        let checkout = self.checkout.as_ref().expect("Missing checkout");
+        assert!(
+            checkout.phase == CheckoutPhase::Funding,
+            "Checkout is not funding"
+        );
+        if env::promise_result_checked(0, 0).is_err() {
+            return PromiseOrValue::Promise(self.refund_checkout(false));
+        }
+
         self.agent = None;
         self.policy = Some(Policy {
-            id,
+            id: checkout.policy_id,
             activation_height: env::block_height(),
             phase: Phase::Active,
             votes: 0,
             loss: NearToken::from_yoctonear(0),
             payout: NearToken::from_yoctonear(0),
         });
-        id
+        self.checkout = None;
+        PromiseOrValue::Value(true)
+    }
+
+    pub fn retry_checkout_refund(&mut self) -> Promise {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
+        assert!(
+            self.checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.phase == CheckoutPhase::RefundAvailable),
+            "No refund available"
+        );
+        self.refund_checkout(true)
+    }
+
+    #[private]
+    pub fn finish_checkout_refund(&mut self, retry: bool) -> bool {
+        let checkout = self.checkout.as_mut().expect("Missing checkout refund");
+        assert!(
+            checkout.phase == CheckoutPhase::Refunding,
+            "Checkout is not refunding"
+        );
+        if env::promise_result_checked(0, 0).is_ok() {
+            self.checkout = None;
+            return retry;
+        }
+        checkout.phase = CheckoutPhase::RefundAvailable;
+        false
+    }
+
+    fn checkout_total() -> NearToken {
+        PREMIUM
+            .checked_add(WALLET_FUNDING)
+            .expect("Checkout amount overflow")
+    }
+
+    fn refund_checkout(&mut self, retry: bool) -> Promise {
+        self.checkout.as_mut().expect("Missing checkout").phase = CheckoutPhase::Refunding;
+        Promise::new(self.owner.clone())
+            .transfer(Self::checkout_total())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(12))
+                    .finish_checkout_refund(retry),
+            )
     }
 
     #[payable]

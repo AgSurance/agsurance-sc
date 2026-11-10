@@ -14,6 +14,8 @@ pub struct Incident {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct AgentWallet {
+    vault: AccountId,
+    funded_policy_id: u32,
     runner: AccountId,
     recipient: AccountId,
     pending: Option<u32>,
@@ -23,9 +25,11 @@ pub struct AgentWallet {
 #[near]
 impl AgentWallet {
     #[init]
-    pub fn new(runner: AccountId, recipient: AccountId) -> Self {
+    pub fn new(vault: AccountId, runner: AccountId, recipient: AccountId) -> Self {
         assert!(env::current_account_id().as_str().ends_with(".testnet"));
         Self {
+            vault,
+            funded_policy_id: 0,
             runner,
             recipient,
             pending: None,
@@ -41,6 +45,14 @@ impl AgentWallet {
         self.incident.clone()
     }
 
+    #[payable]
+    pub fn fund_checkout(&mut self, policy_id: u32) {
+        assert_eq!(env::predecessor_account_id(), self.vault, "Vault required");
+        assert_eq!(env::attached_deposit(), LOSS, "Incorrect wallet funding");
+        assert!(policy_id > self.funded_policy_id, "Policy already funded");
+        self.funded_policy_id = policy_id;
+    }
+
     // An explicit test fixture with a fixed destination. Deploy only with test funds.
     pub fn simulate_loss(&mut self, policy_id: u32) -> Promise {
         assert_eq!(
@@ -49,6 +61,7 @@ impl AgentWallet {
             "Runner required"
         );
         assert!(self.pending.is_none(), "Transfer pending");
+        assert_eq!(policy_id, self.funded_policy_id, "Policy funding required");
         assert!(
             policy_id > self.incident.as_ref().map_or(0, |i| i.policy_id),
             "Loss already simulated"
