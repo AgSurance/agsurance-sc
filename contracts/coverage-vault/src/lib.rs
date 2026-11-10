@@ -1,15 +1,18 @@
+use near_sdk::store::LookupMap;
 use near_sdk::{
     env, near, AccountId, Allowance, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
     PromiseOrValue, PublicKey,
 };
 
 const PREMIUM: NearToken = NearToken::from_millinear(10);
-const WALLET_FUNDING: NearToken = NearToken::from_millinear(300);
+const WALLET_FUNDING: NearToken = NearToken::from_millinear(350);
+const MAX_SUPPLIER_LIMIT: NearToken = NearToken::from_millinear(50);
 const LIMIT: NearToken = NearToken::from_millinear(400);
 const AGENT_FUNDING: NearToken = NearToken::from_millinear(100);
 const DEDUCTIBLE: NearToken = NearToken::from_millinear(50);
 
 #[near(serializers = [borsh, json])]
+#[derive(Clone)]
 pub struct Incident {
     policy_id: u32,
     amount: NearToken,
@@ -30,6 +33,23 @@ enum Phase {
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone)]
+pub struct Mandate {
+    supplier: AccountId,
+    limit: NearToken,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, PartialEq, Eq)]
+pub struct Evidence {
+    transaction_hash: String,
+    receipt_id: String,
+    block_height: u64,
+    recipient: AccountId,
+    amount: NearToken,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone)]
 struct Policy {
     id: u32,
     activation_height: u64,
@@ -37,6 +57,9 @@ struct Policy {
     votes: u8,
     loss: NearToken,
     payout: NearToken,
+    mandate: Mandate,
+    incident: Option<Incident>,
+    evidence: Option<Evidence>,
 }
 
 #[near(serializers = [borsh, json])]
@@ -60,6 +83,7 @@ enum CheckoutPhase {
 struct Checkout {
     policy_id: u32,
     phase: CheckoutPhase,
+    mandate: Mandate,
 }
 
 #[near(serializers = [json])]
@@ -75,6 +99,7 @@ pub struct Dashboard {
     agent: Option<Agent>,
     agent_funding: NearToken,
     wallet_funding: NearToken,
+    max_supplier_limit: NearToken,
     checkout: Option<Checkout>,
 }
 
@@ -89,6 +114,7 @@ pub struct CoverageVault {
     policy: Option<Policy>,
     agent: Option<Agent>,
     agent_sequence: u32,
+    mandates: LookupMap<u32, Mandate>,
     checkout: Option<Checkout>,
 }
 
@@ -124,6 +150,7 @@ impl CoverageVault {
             policy: None,
             agent: None,
             agent_sequence: 0,
+            mandates: LookupMap::new(b"m"),
             checkout: None,
         }
     }
@@ -155,6 +182,7 @@ impl CoverageVault {
             agent: self.agent.clone(),
             agent_funding: AGENT_FUNDING,
             wallet_funding: WALLET_FUNDING,
+            max_supplier_limit: MAX_SUPPLIER_LIMIT,
             checkout: self.checkout.clone(),
         }
     }
@@ -168,7 +196,17 @@ impl CoverageVault {
     }
 
     #[payable]
-    pub fn buy_policy(&mut self) -> Promise {
+    pub fn buy_policy(&mut self, supplier: AccountId, limit: NearToken) -> Promise {
+        assert!(
+            supplier.as_str().ends_with(".testnet")
+                && supplier != self.wallet
+                && supplier != env::current_account_id(),
+            "Invalid supplier"
+        );
+        assert!(
+            !limit.is_zero() && limit <= MAX_SUPPLIER_LIMIT,
+            "Invalid spending limit"
+        );
         assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
         assert!(self.checkout.is_none(), "Checkout already pending");
         assert!(
@@ -185,15 +223,19 @@ impl CoverageVault {
             .policy
             .as_ref()
             .map_or(1, |p| p.id.checked_add(1).expect("Policy ID overflow"));
+        let mandate = Mandate { supplier, limit };
         self.checkout = Some(Checkout {
             policy_id: id,
             phase: CheckoutPhase::Funding,
+            mandate: mandate.clone(),
         });
         Promise::new(self.wallet.clone())
             .function_call(
                 "fund_checkout",
-                near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({ "policy_id": id }))
-                    .expect("Policy ID"),
+                near_sdk::serde_json::to_vec(
+                    &near_sdk::serde_json::json!({ "policy_id": id, "mandate": mandate }),
+                )
+                .expect("Policy ID"),
                 WALLET_FUNDING,
                 Gas::from_tgas(12),
             )
@@ -216,6 +258,8 @@ impl CoverageVault {
         }
 
         self.agent = None;
+        self.mandates
+            .insert(checkout.policy_id, checkout.mandate.clone());
         self.policy = Some(Policy {
             id: checkout.policy_id,
             activation_height: env::block_height(),
@@ -223,6 +267,9 @@ impl CoverageVault {
             votes: 0,
             loss: NearToken::from_yoctonear(0),
             payout: NearToken::from_yoctonear(0),
+            mandate: checkout.mandate.clone(),
+            incident: None,
+            evidence: None,
         });
         self.checkout = None;
         PromiseOrValue::Value(true)
@@ -305,7 +352,7 @@ impl CoverageVault {
                 public_key,
                 Allowance::limited(AGENT_FUNDING).expect("Nonzero allowance"),
                 vault.clone(),
-                "submit_claim",
+                "submit_claim,pay_supplier",
             )
             .then(
                 Self::ext(vault)
@@ -349,7 +396,29 @@ impl CoverageVault {
         self.agent = None;
     }
 
-    pub fn submit_claim(&mut self, policy_id: u32) -> Promise {
+    pub fn mandate(&self, policy_id: u32) -> Option<Mandate> {
+        self.mandates.get(&policy_id).cloned()
+    }
+
+    pub fn pay_supplier(&self, policy_id: u32, recipient: AccountId, amount: NearToken) -> Promise {
+        self.assert_connected_agent();
+        let policy = self.policy.as_ref().expect("No policy");
+        assert!(
+            policy.id == policy_id && policy.phase == Phase::Active,
+            "Active policy required"
+        );
+        Promise::new(self.wallet.clone()).function_call(
+            "pay_supplier",
+            near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+                "policy_id": policy_id, "recipient": recipient, "amount": amount,
+            }))
+            .expect("Payment parameters"),
+            NearToken::from_yoctonear(0),
+            Gas::from_tgas(40),
+        )
+    }
+
+    fn assert_connected_agent(&self) {
         let caller = env::predecessor_account_id();
         assert!(
             self.agent.as_ref().is_some_and(|agent| agent.connected
@@ -357,6 +426,10 @@ impl CoverageVault {
                 && agent.public_key == env::signer_account_pk()),
             "Connected agent required"
         );
+    }
+
+    pub fn submit_claim(&mut self, policy_id: u32) -> Promise {
+        self.assert_connected_agent();
         let policy = self.policy.as_mut().expect("No policy");
         assert!(
             policy.id == policy_id && policy.phase == Phase::Active,
@@ -398,6 +471,7 @@ impl CoverageVault {
                     .checked_sub(DEDUCTIBLE)
                     .expect("Deductible")
                     .min(LIMIT);
+                policy.incident = Some(incident);
                 policy.phase = Phase::InReview;
                 return true;
             }
@@ -406,7 +480,7 @@ impl CoverageVault {
         false
     }
 
-    pub fn approve_claim(&mut self, policy_id: u32) -> u32 {
+    pub fn approve_claim(&mut self, policy_id: u32, evidence: Evidence) -> u32 {
         let reviewer = self
             .reviewers
             .iter()
@@ -417,6 +491,26 @@ impl CoverageVault {
             policy.id == policy_id && policy.phase == Phase::InReview,
             "Claim is not in review"
         );
+        let incident = policy.incident.as_ref().expect("Missing claim incident");
+        assert!(
+            evidence.recipient == incident.recipient
+                && evidence.amount == incident.amount
+                && evidence.block_height >= policy.activation_height
+                && evidence.block_height <= incident.block_height,
+            "Evidence does not match the recorded loss"
+        );
+        assert!(
+            evidence.recipient != policy.mandate.supplier || evidence.amount > policy.mandate.limit,
+            "Transfer matches the mandate"
+        );
+        if let Some(previous) = &policy.evidence {
+            assert!(
+                previous == &evidence,
+                "Reviewers must attest to the same receipt"
+            );
+        } else {
+            policy.evidence = Some(evidence);
+        }
         let vote = 1 << reviewer;
         assert!(policy.votes & vote == 0, "Reviewer already voted");
         policy.votes |= vote;
