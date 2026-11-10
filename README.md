@@ -15,3 +15,5 @@ Compile both packages from the workspace:
 rustup target add wasm32-unknown-unknown
 cargo build --locked --release --target wasm32-unknown-unknown
 ```
+
+The first testnet demo uses `agent-wallet` as an explicit loss fixture. It transfers 0.3 testnet NEAR to a fixed demo recipient and saves the incident after its transfer succeeds. `coverage-vault` sells a policy, queries that wallet record, requires two of three reviewer approvals, and transfers the capped payout to a fixed recovery account. The demo serializes one active policy per deployment. Run the frontend's `scripts/setup-testnet.ts` to provision both contracts and the isolated test accounts.
