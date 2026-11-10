@@ -1,7 +1,11 @@
-use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError};
+use near_sdk::{
+    env, near, AccountId, Allowance, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
+    PublicKey,
+};
 
 const PREMIUM: NearToken = NearToken::from_millinear(10);
 const LIMIT: NearToken = NearToken::from_millinear(400);
+const AGENT_FUNDING: NearToken = NearToken::from_millinear(100);
 const DEDUCTIBLE: NearToken = NearToken::from_millinear(50);
 
 #[near(serializers = [borsh, json])]
@@ -34,6 +38,14 @@ struct Policy {
     payout: NearToken,
 }
 
+#[near(serializers = [borsh, json])]
+#[derive(Clone)]
+struct Agent {
+    account_id: AccountId,
+    public_key: PublicKey,
+    connected: bool,
+}
+
 #[near(serializers = [json])]
 pub struct Dashboard {
     reserve: NearToken,
@@ -43,6 +55,9 @@ pub struct Dashboard {
     deductible: NearToken,
     policy: Option<Policy>,
     beneficiary: AccountId,
+    owner: AccountId,
+    agent: Option<Agent>,
+    agent_funding: NearToken,
 }
 
 #[near(contract_state)]
@@ -50,11 +65,12 @@ pub struct Dashboard {
 pub struct CoverageVault {
     owner: AccountId,
     wallet: AccountId,
-    runner: AccountId,
     beneficiary: AccountId,
     reviewers: [AccountId; 3],
     reserve: NearToken,
     policy: Option<Policy>,
+    agent: Option<Agent>,
+    agent_sequence: u32,
 }
 
 #[near]
@@ -83,11 +99,12 @@ impl CoverageVault {
         Self {
             owner,
             wallet,
-            runner,
             beneficiary,
             reviewers,
             reserve: NearToken::from_yoctonear(0),
             policy: None,
+            agent: None,
+            agent_sequence: 0,
         }
     }
 
@@ -109,6 +126,9 @@ impl CoverageVault {
             deductible: DEDUCTIBLE,
             policy: self.policy.clone(),
             beneficiary: self.beneficiary.clone(),
+            owner: self.owner.clone(),
+            agent: self.agent.clone(),
+            agent_funding: AGENT_FUNDING,
         }
     }
 
@@ -133,6 +153,7 @@ impl CoverageVault {
             .policy
             .as_ref()
             .map_or(1, |p| p.id.checked_add(1).expect("Policy ID overflow"));
+        self.agent = None;
         self.policy = Some(Policy {
             id,
             activation_height: env::block_height(),
@@ -144,11 +165,91 @@ impl CoverageVault {
         id
     }
 
-    pub fn submit_claim(&mut self, policy_id: u32) -> Promise {
+    #[payable]
+    pub fn connect_agent(&mut self, policy_id: u32, public_key: PublicKey) -> Promise {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
         assert_eq!(
-            env::predecessor_account_id(),
-            self.runner,
-            "Runner required"
+            env::attached_deposit(),
+            AGENT_FUNDING,
+            "Incorrect agent funding"
+        );
+        let policy = self.policy.as_ref().expect("No policy");
+        assert!(
+            policy.id == policy_id && policy.phase == Phase::Active,
+            "Active policy required"
+        );
+        assert!(self.agent.is_none(), "Agent already connected or pending");
+        self.agent_sequence = self
+            .agent_sequence
+            .checked_add(1)
+            .expect("Agent ID overflow");
+        let vault = env::current_account_id();
+        let account_id: AccountId = format!("agent-{}.{}", self.agent_sequence, vault)
+            .parse()
+            .expect("Vault account ID is too long for an agent subaccount");
+        self.agent = Some(Agent {
+            account_id: account_id.clone(),
+            public_key: public_key.clone(),
+            connected: false,
+        });
+        Promise::new(account_id)
+            .create_account()
+            .transfer(AGENT_FUNDING)
+            .add_access_key_allowance(
+                public_key,
+                Allowance::limited(AGENT_FUNDING).expect("Nonzero allowance"),
+                vault.clone(),
+                "submit_claim",
+            )
+            .then(
+                Self::ext(vault)
+                    .with_static_gas(Gas::from_tgas(16))
+                    .finish_connect_agent(),
+            )
+    }
+
+    #[private]
+    pub fn finish_connect_agent(&mut self) -> bool {
+        let agent = self.agent.as_mut().expect("No pending agent");
+        assert!(!agent.connected, "Agent is already connected");
+        if env::promise_result_checked(0, 0).is_err() {
+            self.agent = None;
+            Promise::new(self.owner.clone())
+                .transfer(AGENT_FUNDING)
+                .detach();
+            return false;
+        }
+        agent.connected = true;
+        true
+    }
+
+    #[payable]
+    pub fn revoke_agent(&mut self, policy_id: u32) {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
+        assert_eq!(
+            env::attached_deposit(),
+            NearToken::from_yoctonear(1),
+            "Full access approval required"
+        );
+        assert_eq!(
+            self.policy.as_ref().map(|policy| policy.id),
+            Some(policy_id),
+            "Wrong policy"
+        );
+        assert!(
+            self.agent.as_ref().is_some_and(|agent| agent.connected),
+            "No connected agent"
+        );
+        self.agent = None;
+    }
+
+    pub fn submit_claim(&mut self, policy_id: u32) -> Promise {
+        let caller = env::predecessor_account_id();
+        assert!(
+            self.agent.as_ref().is_some_and(|agent| agent.connected
+                && agent.account_id == caller
+                && agent.public_key == env::signer_account_pk()),
+            "Connected agent required"
         );
         let policy = self.policy.as_mut().expect("No policy");
         assert!(
