@@ -128,6 +128,10 @@ impl ReservePool {
     }
 
     pub fn release_failed_checkout(&mut self, policy_id: u32) {
+        self.release_closed_policy(policy_id);
+    }
+
+    pub fn release_closed_policy(&mut self, policy_id: u32) {
         let vault = env::predecessor_account_id();
         assert!(
             self.recipients.contains_key(&vault),

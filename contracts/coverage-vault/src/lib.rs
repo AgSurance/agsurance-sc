@@ -5,6 +5,7 @@ use near_sdk::{
 };
 
 const REVIEW_SECONDS: u32 = 72 * 60 * 60;
+const CLAIM_SECONDS: u32 = 48 * 60 * 60;
 const WEEK: u32 = 7 * 24 * 60 * 60;
 const WINDOW_COUNT: usize = 4;
 
@@ -34,6 +35,9 @@ enum Phase {
     Approved,
     Paying,
     Paid,
+    Rejected,
+    Closing,
+    Closed,
 }
 
 #[near(serializers = [borsh, json])]
@@ -51,6 +55,7 @@ pub struct Evidence {
     block_height: u64,
     recipient: AccountId,
     amount: NearToken,
+    block_timestamp_ms: Option<u64>,
 }
 
 #[near(serializers = [borsh, json])]
@@ -108,6 +113,9 @@ struct Coverage {
     recovery_pending: bool,
     retired: bool,
     unused_premium: bool,
+    filing_deadline: Option<u64>,
+    retired_at_ms: Option<u64>,
+    window_seconds: u32,
 }
 
 #[near(serializers = [json])]
@@ -134,6 +142,8 @@ pub struct Dashboard {
     max_supplier_limit: NearToken,
     checkout: Option<Checkout>,
     coverage: Coverage,
+    chain_time: u64,
+    wallet: AccountId,
 }
 
 #[near(contract_state)]
@@ -154,8 +164,10 @@ pub struct CoverageVault {
     renewal: Option<u8>,
     paused: bool,
     recovery_pending: bool,
-    retired_at: Option<u64>,
+    retired_at_ms: Option<u64>,
     premium_refund_pending: bool,
+    claim_seconds: u32,
+    policy_sequence: u32,
 }
 
 #[near]
@@ -170,6 +182,7 @@ impl CoverageVault {
         test_window_seconds: Option<u32>,
         reserve_pool: AccountId,
         test_review_seconds: Option<u32>,
+        test_claim_seconds: Option<u32>,
     ) -> Self {
         assert!(env::current_account_id().as_str().ends_with(".testnet"));
         assert!(
@@ -194,9 +207,14 @@ impl CoverageVault {
             "Invalid recovery account"
         );
         let review_seconds = test_review_seconds.unwrap_or(REVIEW_SECONDS);
+        let claim_seconds = test_claim_seconds.unwrap_or(CLAIM_SECONDS);
         assert!(
             (1..=REVIEW_SECONDS).contains(&review_seconds),
             "Invalid review deadline"
+        );
+        assert!(
+            (1..=CLAIM_SECONDS).contains(&claim_seconds),
+            "Invalid filing window"
         );
         assert!(
             reserve_pool.as_str().ends_with(".testnet")
@@ -219,8 +237,10 @@ impl CoverageVault {
             renewal: None,
             paused: false,
             recovery_pending: false,
-            retired_at: None,
+            retired_at_ms: None,
             premium_refund_pending: false,
+            claim_seconds,
+            policy_sequence: 0,
         }
     }
 
@@ -229,7 +249,10 @@ impl CoverageVault {
     }
 
     pub fn dashboard(&self) -> Dashboard {
-        let reserved = if self.policy.as_ref().is_some_and(|p| p.phase != Phase::Paid)
+        let reserved = if self
+            .policy
+            .as_ref()
+            .is_some_and(|p| !matches!(p.phase, Phase::Paid | Phase::Closed))
             || self.checkout.as_ref().is_some_and(|checkout| {
                 matches!(
                     checkout.phase,
@@ -257,11 +280,18 @@ impl CoverageVault {
             max_supplier_limit: MAX_SUPPLIER_LIMIT,
             checkout: self.checkout.clone(),
             coverage: self.coverage(),
+            chain_time: Self::now(),
+            wallet: self.wallet.clone(),
         }
     }
 
     #[payable]
-    pub fn buy_policy(&mut self, supplier: AccountId, limit: NearToken) -> Promise {
+    pub fn buy_policy(
+        &mut self,
+        supplier: AccountId,
+        limit: NearToken,
+        expected_policy_id: Option<u32>,
+    ) -> Promise {
         assert!(
             supplier.as_str().ends_with(".testnet")
                 && supplier != self.wallet
@@ -273,10 +303,23 @@ impl CoverageVault {
             "Invalid spending limit"
         );
         assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
+        if let Some(id) = expected_policy_id {
+            assert_eq!(
+                id,
+                self.policy.as_ref().map_or(0, |policy| policy.id),
+                "Stale policy"
+            );
+        }
         assert!(self.checkout.is_none(), "Checkout already pending");
         assert!(!self.paused && self.renewal.is_none(), "Wallet unavailable");
         assert!(
-            self.policy.as_ref().is_none_or(|p| p.phase == Phase::Paid),
+            self.agent.as_ref().is_none_or(|agent| agent.connected),
+            "Agent connection pending"
+        );
+        assert!(
+            self.policy
+                .as_ref()
+                .is_none_or(|p| matches!(p.phase, Phase::Paid | Phase::Closed)),
             "Policy already active"
         );
         assert_eq!(
@@ -284,10 +327,11 @@ impl CoverageVault {
             Self::checkout_total(),
             "Incorrect checkout amount"
         );
-        let id = self
-            .policy
-            .as_ref()
-            .map_or(1, |p| p.id.checked_add(1).expect("Policy ID overflow"));
+        self.policy_sequence = self
+            .policy_sequence
+            .checked_add(1)
+            .expect("Policy ID overflow");
+        let id = self.policy_sequence;
         let mandate = Mandate { supplier, limit };
         self.checkout = Some(Checkout {
             policy_id: id,
@@ -372,13 +416,63 @@ impl CoverageVault {
         PromiseOrValue::Value(true)
     }
 
-    pub fn retry_checkout_refund(&mut self) -> Promise {
+    pub fn retry_checkout_refund(&mut self, policy_id: Option<u32>) -> Promise {
         assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
-        match self.checkout.as_ref().expect("No refund available").phase {
+        let checkout = self.checkout.as_ref().expect("No refund available");
+        assert!(
+            policy_id.is_none_or(|id| id == checkout.policy_id),
+            "Stale checkout"
+        );
+        match checkout.phase {
             CheckoutPhase::RefundAvailable => self.refund_checkout(true),
             CheckoutPhase::ReleaseAvailable => self.release_checkout(true),
             _ => env::panic_str("No refund available"),
         }
+    }
+
+    pub fn close_policy(&mut self, policy_id: u32) -> Promise {
+        let deadline = self.filing_deadline().expect("No policy");
+        let policy = self.policy.as_mut().expect("No policy");
+        assert_eq!(policy.id, policy_id, "Wrong policy");
+        assert!(Self::now() >= deadline, "Claim filing window is open");
+        assert!(
+            matches!(
+                policy.phase,
+                Phase::Active | Phase::Rejected | Phase::Closing
+            ),
+            "Policy cannot be closed"
+        );
+        assert!(
+            self.checkout.is_none() && self.renewal.is_none(),
+            "Payment pending"
+        );
+        policy.phase = Phase::Closing;
+        self.pool_call(
+            "release_closed_policy",
+            near_sdk::serde_json::json!({ "policy_id": policy_id }),
+            12,
+        )
+        .then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(Gas::from_tgas(14))
+                .finish_close(policy_id),
+        )
+    }
+
+    #[private]
+    pub fn finish_close(&mut self, policy_id: u32) -> bool {
+        let policy = self.policy.as_mut().expect("No policy");
+        if policy.id != policy_id {
+            return false;
+        }
+        if policy.phase == Phase::Closed {
+            return true;
+        }
+        if policy.phase != Phase::Closing || env::promise_result_checked(0, 0).is_err() {
+            return false;
+        }
+        policy.phase = Phase::Closed;
+        true
     }
 
     fn release_checkout(&mut self, retry: bool) -> Promise {
@@ -649,7 +743,7 @@ impl CoverageVault {
             "Recovery account required"
         );
         assert!(
-            self.paused && !self.recovery_pending && self.retired_at.is_none(),
+            self.paused && !self.recovery_pending && self.retired_at_ms.is_none(),
             "Wallet cannot be recovered"
         );
         assert!(self.renewal.is_none(), "Premium pending");
@@ -683,7 +777,7 @@ impl CoverageVault {
     ) -> bool {
         self.recovery_pending = false;
         if result.unwrap_or(false) {
-            self.retired_at = Some(Self::now());
+            self.retired_at_ms = Some(env::block_timestamp_ms());
             return true;
         }
         false
@@ -733,12 +827,23 @@ impl CoverageVault {
     }
 
     fn unused_window(&self) -> Option<usize> {
-        let retired_at = self.retired_at?;
+        let retired_at_ms = self.retired_at_ms?;
         self.policy
             .as_ref()?
             .windows
             .iter()
-            .position(|start| start.is_some_and(|start| start > retired_at))
+            .position(|start| start.is_some_and(|start| start * 1000 > retired_at_ms))
+    }
+
+    fn term_end(&self, policy: &Policy) -> u64 {
+        let scheduled_end = Self::window_start(policy, self.window_seconds, WINDOW_COUNT);
+        self.retired_at_ms
+            .map_or(scheduled_end, |retired| (retired / 1000).min(scheduled_end))
+    }
+
+    fn filing_deadline(&self) -> Option<u64> {
+        let policy = self.policy.as_ref()?;
+        Some(self.term_end(policy) + u64::from(self.claim_seconds))
     }
 
     fn coverage(&self) -> Coverage {
@@ -752,7 +857,7 @@ impl CoverageVault {
                 current_window = Some(index as u8);
                 let boundary = Self::window_start(policy, self.window_seconds, index + 1);
                 next_boundary = Some(boundary);
-                active = self.retired_at.is_none()
+                active = self.retired_at_ms.is_none()
                     && policy.windows[index].is_some_and(|start| start <= now);
                 if !self.paused && policy.phase == Phase::Active {
                     if !active {
@@ -774,8 +879,11 @@ impl CoverageVault {
             renewal_pending: self.renewal.is_some(),
             paused: self.paused,
             recovery_pending: self.recovery_pending,
-            retired: self.retired_at.is_some(),
+            retired: self.retired_at_ms.is_some(),
             unused_premium: !self.premium_refund_pending && self.unused_window().is_some(),
+            filing_deadline: self.filing_deadline(),
+            retired_at_ms: self.retired_at_ms,
+            window_seconds: self.window_seconds,
         }
     }
 
@@ -794,6 +902,10 @@ impl CoverageVault {
         if caller != self.beneficiary && caller != self.owner {
             self.assert_connected_agent();
         }
+        assert!(
+            Self::now() < self.filing_deadline().expect("No policy"),
+            "Claim filing window has closed"
+        );
         let policy = self.policy.as_mut().expect("No policy");
         assert!(
             policy.id == policy_id && policy.phase == Phase::Active,
@@ -825,16 +937,7 @@ impl CoverageVault {
             "No pending evidence"
         );
         if let Ok(Some(incident)) = result {
-            if incident.policy_id == policy.id
-                && incident.block_height >= policy.activation_height
-                && Self::window_at(policy, self.window_seconds, incident.recorded_at)
-                    .and_then(|window| policy.windows[window])
-                    .is_some_and(|start| start <= incident.recorded_at)
-                && self
-                    .retired_at
-                    .is_none_or(|retired| incident.recorded_at <= retired)
-                && incident.amount > DEDUCTIBLE
-            {
+            if incident.policy_id == policy.id && incident.amount > DEDUCTIBLE {
                 policy.loss = incident.amount;
                 policy.payout = incident
                     .amount
@@ -852,12 +955,20 @@ impl CoverageVault {
     }
 
     pub fn approve_claim(&mut self, policy_id: u32, evidence: Evidence) -> u32 {
+        self.vote_claim(policy_id, evidence, true)
+    }
+
+    pub fn reject_claim(&mut self, policy_id: u32, evidence: Evidence) -> u32 {
+        self.vote_claim(policy_id, evidence, false)
+    }
+
+    fn vote_claim(&mut self, policy_id: u32, evidence: Evidence, approve: bool) -> u32 {
         let reviewer = self
             .reviewers
             .iter()
             .position(|r| r == &env::predecessor_account_id())
             .expect("Reviewer required");
-        let policy = self.policy.as_mut().expect("No policy");
+        let policy = self.policy.as_ref().expect("No policy");
         assert!(
             policy.id == policy_id && policy.phase == Phase::InReview,
             "Claim is not in review"
@@ -866,7 +977,6 @@ impl CoverageVault {
         assert!(
             evidence.recipient == incident.recipient
                 && evidence.amount == incident.amount
-                && evidence.block_height >= policy.activation_height
                 && evidence.block_height <= incident.block_height,
             "Evidence does not match the recorded loss"
         );
@@ -874,6 +984,21 @@ impl CoverageVault {
             evidence.recipient != policy.mandate.supplier || evidence.amount > policy.mandate.limit,
             "Transfer matches the mandate"
         );
+        let time_ms = evidence
+            .block_timestamp_ms
+            .expect("Transfer block timestamp required");
+        let time = time_ms / 1000;
+        assert!(time <= incident.recorded_at, "Transfer follows incident");
+        let covered = evidence.block_height >= policy.activation_height
+            && self.retired_at_ms.is_none_or(|retired| time_ms < retired)
+            && Self::window_at(policy, self.window_seconds, time)
+                .and_then(|window| policy.windows[window])
+                .is_some_and(|start| start <= time);
+        assert_eq!(
+            approve, covered,
+            "Vote does not match coverage at transfer time"
+        );
+        let policy = self.policy.as_mut().expect("No policy");
         if let Some(previous) = &policy.evidence {
             assert!(
                 previous == &evidence,
@@ -887,7 +1012,11 @@ impl CoverageVault {
         policy.votes |= vote;
         let count = policy.votes.count_ones();
         if count == 2 {
-            policy.phase = Phase::Approved;
+            policy.phase = if approve {
+                Phase::Approved
+            } else {
+                Phase::Rejected
+            };
         }
         count
     }
