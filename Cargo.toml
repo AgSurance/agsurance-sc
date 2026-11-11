@@ -1,5 +1,6 @@
 [workspace]
-members = ["contracts/agent-wallet", "contracts/coverage-vault", "contracts/reserve-pool"]
+members = ["contracts/agent-wallet", "contracts/coverage-vault", "contracts/reserve-pool", "contracts/manual-demo-factory"]
+default-members = ["contracts/agent-wallet", "contracts/coverage-vault", "contracts/reserve-pool"]
 resolver = "2"
 
 [workspace.package]

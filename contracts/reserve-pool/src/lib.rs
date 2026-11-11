@@ -31,6 +31,23 @@ pub struct ReserveStatus {
     quarantined: NearToken,
 }
 
+#[near(serializers = [borsh, json])]
+#[derive(Clone)]
+pub struct PoolLimits {
+    max_policy: NearToken,
+    max_group: NearToken,
+    registrar: AccountId,
+}
+
+#[near(serializers = [json])]
+pub struct PoolCapacity {
+    limits: PoolLimits,
+    group_remaining: NearToken,
+    liquid_available: NearToken,
+    issuing: bool,
+    buffer: NearToken,
+}
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct ReservePool {
@@ -44,6 +61,10 @@ pub struct ReservePool {
     capital: Option<CapitalPilot>,
     open_premium_accounts: u32,
     beneficiary_locked: LookupSet<AccountId>,
+    limits: Option<PoolLimits>,
+    groups: LookupMap<AccountId, String>,
+    group_locked: LookupMap<String, NearToken>,
+    policy_limits: LookupMap<(AccountId, u32), NearToken>,
 }
 
 #[near]
@@ -62,6 +83,10 @@ impl ReservePool {
             capital: None,
             open_premium_accounts: 0,
             beneficiary_locked: LookupSet::new(b"b"),
+            limits: None,
+            groups: LookupMap::new(b"g"),
+            group_locked: LookupMap::new(b"e"),
+            policy_limits: LookupMap::new(b"l"),
         }
     }
 
@@ -87,7 +112,12 @@ impl ReservePool {
     }
 
     pub fn register_vault(&mut self, vault: AccountId, beneficiary: AccountId) {
-        self.assert_operator();
+        let registrar = self.limits.as_ref().map(|limits| &limits.registrar);
+        let caller = env::predecessor_account_id();
+        assert!(
+            caller == self.operator || registrar == Some(&caller),
+            "Authorized vault registrar required"
+        );
         assert!(vault.as_str().ends_with(".testnet") && beneficiary.as_str().ends_with(".testnet"));
         assert_ne!(
             beneficiary,
@@ -99,6 +129,57 @@ impl ReservePool {
             "Vault already registered"
         );
         self.recipients.insert(vault, beneficiary);
+    }
+
+    pub fn configure_rolling_limits(
+        &mut self,
+        max_policy: NearToken,
+        max_group: NearToken,
+        registrar: AccountId,
+    ) {
+        self.assert_operator();
+        assert!(
+            self.limits.is_none() && self.assets == ZERO && self.locked == ZERO,
+            "Configure an empty pool"
+        );
+        assert!(
+            self.capital.as_ref().is_some_and(CapitalPilot::is_unfunded),
+            "Configure capital first"
+        );
+        assert!(
+            max_policy > ZERO && max_group >= max_policy,
+            "Invalid underwriting limits"
+        );
+        self.limits = Some(PoolLimits {
+            max_policy,
+            max_group,
+            registrar,
+        });
+    }
+
+    pub fn register_vault_group(
+        &mut self,
+        vault: AccountId,
+        beneficiary: AccountId,
+        group: String,
+    ) {
+        assert!(self.limits.is_some(), "Dynamic pool required");
+        assert!(!group.is_empty() && group.len() <= 64, "Invalid risk group");
+        self.register_vault(vault.clone(), beneficiary);
+        self.groups.insert(vault, group);
+    }
+
+    pub fn pool_capacity(&self, group: String) -> Option<PoolCapacity> {
+        let limits = self.limits.clone()?;
+        Some(PoolCapacity {
+            group_remaining: limits
+                .max_group
+                .saturating_sub(self.group_locked.get(&group).copied().unwrap_or(ZERO)),
+            limits,
+            liquid_available: self.reserve_status().available,
+            issuing: self.capital.as_ref().is_some_and(CapitalPilot::can_issue),
+            buffer: self.capital.as_ref().map_or(ZERO, CapitalPilot::buffer),
+        })
     }
 
     pub fn set_initial_beneficiary(&mut self, beneficiary: AccountId) {
@@ -151,33 +232,110 @@ impl ReservePool {
             .expect("Collateral overflow");
     }
 
-    pub fn reserve_policy(&mut self, policy_id: u32) -> bool {
+    pub fn reserve_policy(&mut self, policy_id: u32, limit: Option<NearToken>) -> bool {
         let vault = env::predecessor_account_id();
         assert!(
             self.recipients.contains_key(&vault),
             "Registered vault required"
         );
         let key = (vault.clone(), policy_id);
+        let limit = if self.limits.is_some() {
+            limit.expect("Choose a policy limit")
+        } else {
+            assert!(
+                limit.is_none() || limit == Some(LIMIT),
+                "Fixed limit required"
+            );
+            LIMIT
+        };
         if let Some(allocation) = self.allocations.get(&key) {
-            return matches!(allocation, Allocation::Reserved);
+            return matches!(allocation, Allocation::Reserved) && self.policy_limit(&key) == limit;
         }
-        let locked = self.locked.checked_add(LIMIT).expect("Allocation overflow");
-        let buffer = self.capital.as_ref().map_or(ZERO, CapitalPilot::buffer);
-        if self
-            .capital
-            .as_ref()
-            .is_some_and(|pilot| !pilot.can_issue())
-            || locked.checked_add(buffer).expect("Allocation overflow") > self.assets
-        {
+        if !self.add_exposure(&vault, ZERO, limit) {
             return false;
         }
+        self.policy_limits.insert(key.clone(), limit);
         self.allocations.insert(key, Allocation::Reserved);
         self.beneficiary_locked.insert(vault);
-        self.locked = locked;
         if self.capital.is_some() {
             self.open_premium_accounts += 1;
         }
         true
+    }
+
+    pub fn increase_policy_limit(
+        &mut self,
+        policy_id: u32,
+        previous: NearToken,
+        limit: NearToken,
+    ) -> bool {
+        assert!(
+            self.limits.is_some() && limit > previous,
+            "Invalid increase"
+        );
+        let vault = env::predecessor_account_id();
+        let key = (vault.clone(), policy_id);
+        if !matches!(self.allocations.get(&key), Some(Allocation::Reserved)) {
+            return false;
+        }
+        let current = self.policy_limit(&key);
+        if current == limit {
+            return true;
+        }
+        if current != previous || !self.add_exposure(&vault, previous, limit) {
+            return false;
+        }
+        self.policy_limits.insert(key, limit);
+        true
+    }
+
+    fn add_exposure(&mut self, vault: &AccountId, previous: NearToken, limit: NearToken) -> bool {
+        let delta = limit.saturating_sub(previous);
+        if delta == ZERO
+            || self
+                .capital
+                .as_ref()
+                .is_some_and(|pilot| !pilot.can_issue())
+            || delta > self.reserve_status().available
+        {
+            return false;
+        }
+        if let Some(limits) = &self.limits {
+            let group = self
+                .groups
+                .get(vault)
+                .expect("Registered risk group required")
+                .clone();
+            let exposure = self.group_locked.get(&group).copied().unwrap_or(ZERO);
+            if limit > limits.max_policy || delta > limits.max_group.saturating_sub(exposure) {
+                return false;
+            }
+            self.group_locked.insert(
+                group,
+                exposure
+                    .checked_add(delta)
+                    .expect("Group allocation overflow"),
+            );
+        }
+        self.locked = self.locked.checked_add(delta).expect("Allocation overflow");
+        true
+    }
+
+    fn policy_limit(&self, key: &(AccountId, u32)) -> NearToken {
+        self.policy_limits.get(key).copied().unwrap_or(LIMIT)
+    }
+
+    fn release_exposure(&mut self, key: &(AccountId, u32)) {
+        let limit = self.policy_limit(key);
+        self.policy_limits.remove(key);
+        self.locked = self.locked.checked_sub(limit).expect("Missing allocation");
+        if let Some(group) = self.groups.get(&key.0) {
+            let exposure = self
+                .group_locked
+                .get_mut(group)
+                .expect("Missing group allocation");
+            *exposure = exposure.checked_sub(limit).expect("Missing group exposure");
+        }
     }
 
     pub fn release_failed_checkout(&mut self, policy_id: u32) {
@@ -201,7 +359,7 @@ impl ReservePool {
             None => {}
             Some(Allocation::Reserved) => {
                 self.allocations.remove(&key);
-                self.locked = self.locked.checked_sub(LIMIT).expect("Missing allocation");
+                self.release_exposure(&key);
             }
             _ => env::panic_str("Allocation cannot be released"),
         }
@@ -226,10 +384,10 @@ impl ReservePool {
             }
             Allocation::Reserved => {}
         }
-        assert!(amount <= LIMIT, "Invalid payout amount");
+        assert!(amount <= self.policy_limit(&key), "Invalid payout amount");
         if amount.is_zero() {
+            self.release_exposure(&key);
             self.allocations.insert(key, Allocation::Paid(ZERO));
-            self.locked = self.locked.checked_sub(LIMIT).expect("Missing allocation");
             return PromiseOrValue::Value(Payment::Paid);
         }
         if self.assets < self.locked {
@@ -262,8 +420,8 @@ impl ReservePool {
             self.allocations.insert(key, Allocation::Reserved);
             return Payment::Retry;
         }
+        self.release_exposure(&key);
         self.allocations.insert(key, Allocation::Paid(amount));
-        self.locked = self.locked.checked_sub(LIMIT).expect("Missing allocation");
         self.assets = self.assets.checked_sub(amount).expect("Missing assets");
         if let Some(pilot) = &mut self.capital {
             pilot.record_claim_payout(amount);

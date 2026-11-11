@@ -7,7 +7,9 @@ use near_sdk::{
     PromiseOrValue, PublicKey,
 };
 
+mod limit_increase;
 mod observed_claim;
+use limit_increase::{LimitChange, LimitIncrease};
 mod premium;
 mod recovery_account;
 use observed_claim::ObservedClaim;
@@ -17,6 +19,7 @@ const CLAIM_SECONDS: u32 = 48 * 60 * 60;
 const WEEK: u32 = 7 * 24 * 60 * 60;
 const WINDOW_COUNT: usize = 4;
 
+const ZERO: NearToken = NearToken::from_yoctonear(0);
 const PREMIUM: NearToken = NearToken::from_millinear(10);
 const WALLET_FUNDING: NearToken = NearToken::from_millinear(350);
 const MAX_SUPPLIER_LIMIT: NearToken = NearToken::from_millinear(50);
@@ -71,6 +74,10 @@ pub struct Evidence {
 struct Policy {
     id: u32,
     activation_height: u64,
+    coverage_limit: NearToken,
+    limit_changes: Vec<LimitChange>,
+    paid_premiums: [NearToken; WINDOW_COUNT],
+    claim_limit: NearToken,
     phase: Phase,
     votes: u8,
     loss: NearToken,
@@ -95,6 +102,7 @@ struct Agent {
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CheckoutPhase {
+    CheckingBalance,
     Booking,
     Funding,
     Releasing,
@@ -109,6 +117,9 @@ struct Checkout {
     policy_id: u32,
     phase: CheckoutPhase,
     mandate: Mandate,
+    coverage_limit: NearToken,
+    wallet_funding: NearToken,
+    premium: NearToken,
 }
 
 #[near(serializers = [json])]
@@ -124,6 +135,7 @@ struct Coverage {
     retired: bool,
     unused_premium: bool,
     filing_deadline: Option<u64>,
+    term_end: Option<u64>,
     retired_at_ms: Option<u64>,
     window_seconds: u32,
 }
@@ -158,6 +170,10 @@ pub struct Dashboard {
     wallet_code_hash: Option<String>,
     recovery_choice_available: bool,
     pending_beneficiary: Option<AccountId>,
+    rolling: bool,
+    limit_increase: Option<LimitIncrease>,
+    premiums_distributed: bool,
+    premiums_pending: bool,
 }
 
 #[near(contract_state)]
@@ -193,7 +209,10 @@ pub struct CoverageVault {
     used_transfer_actions: LookupSet<(String, u32)>,
     vendor_confirmations: LookupMap<u32, observed_claim::VendorConfirmation>,
     beneficiary_chosen: bool,
+    increase_sequence: u32,
     pending_beneficiary: Option<AccountId>,
+    rolling: bool,
+    limit_increase: Option<LimitIncrease>,
 }
 
 #[near]
@@ -211,6 +230,7 @@ impl CoverageVault {
         test_claim_seconds: Option<u32>,
         capital_pilot: Option<bool>,
         wallet_code_hash: Option<String>,
+        rolling: Option<bool>,
     ) -> Self {
         assert!(env::current_account_id().as_str().ends_with(".testnet"));
         assert!(
@@ -281,6 +301,9 @@ impl CoverageVault {
             vendor_confirmations: LookupMap::new(b"v"),
             pending_beneficiary: None,
             beneficiary_chosen: false,
+            rolling: rolling.unwrap_or(false),
+            limit_increase: None,
+            increase_sequence: 0,
         }
     }
 
@@ -289,6 +312,12 @@ impl CoverageVault {
     }
 
     pub fn dashboard(&self) -> Dashboard {
+        let limit = self
+            .checkout
+            .as_ref()
+            .map(|checkout| checkout.coverage_limit)
+            .or_else(|| self.policy.as_ref().map(Policy::current_limit))
+            .unwrap_or(LIMIT);
         let reserved = if self
             .policy
             .as_ref()
@@ -301,15 +330,18 @@ impl CoverageVault {
                         | CheckoutPhase::ReleaseAvailable
                 )
             }) {
-            LIMIT
+            limit
         } else {
             NearToken::from_yoctonear(0)
         };
         Dashboard {
             reserve_pool: self.reserve_pool.clone(),
             reserved,
-            premium: PREMIUM,
-            limit: LIMIT,
+            premium: self
+                .checkout
+                .as_ref()
+                .map_or(self.premium_for(limit), |checkout| checkout.premium),
+            limit,
             deductible: DEDUCTIBLE,
             policy: self.policy.clone(),
             claim_recovery: self
@@ -320,7 +352,10 @@ impl CoverageVault {
             owner: self.owner.clone(),
             agent: self.agent.clone(),
             agent_funding: AGENT_FUNDING,
-            wallet_funding: WALLET_FUNDING,
+            wallet_funding: self
+                .checkout
+                .as_ref()
+                .map_or(WALLET_FUNDING, |checkout| checkout.wallet_funding),
             max_supplier_limit: MAX_SUPPLIER_LIMIT,
             checkout: self.checkout.clone(),
             coverage: self.coverage(),
@@ -331,6 +366,10 @@ impl CoverageVault {
                 && self.policy_sequence == 0
                 && self.checkout.is_none(),
             pending_beneficiary: self.pending_beneficiary.clone(),
+            rolling: self.rolling,
+            limit_increase: self.limit_increase.clone(),
+            premiums_distributed: self.premiums_distributed,
+            premiums_pending: self.premiums_pending,
         }
     }
 
@@ -340,6 +379,8 @@ impl CoverageVault {
         supplier: AccountId,
         limit: NearToken,
         expected_policy_id: Option<u32>,
+        coverage_limit: Option<NearToken>,
+        wallet_funding: Option<NearToken>,
     ) -> Promise {
         assert!(
             supplier.as_str().ends_with(".testnet")
@@ -379,9 +420,29 @@ impl CoverageVault {
                 .is_none_or(|p| matches!(p.phase, Phase::Paid | Phase::Closed)),
             "Policy already active"
         );
+        let (coverage_limit, wallet_funding) = if self.rolling {
+            let coverage_limit = coverage_limit.expect("Choose a coverage limit");
+            assert!(
+                coverage_limit >= NearToken::from_millinear(1),
+                "Minimum limit is 0.001 NEAR"
+            );
+            (
+                coverage_limit,
+                wallet_funding.expect("Specify wallet funding"),
+            )
+        } else {
+            assert!(
+                coverage_limit.is_none() && wallet_funding.is_none(),
+                "Fixed checkout required"
+            );
+            (LIMIT, WALLET_FUNDING)
+        };
+        let premium = self.premium_for(coverage_limit);
         assert_eq!(
             env::attached_deposit(),
-            Self::checkout_total(),
+            premium
+                .checked_add(wallet_funding)
+                .expect("Checkout overflow"),
             "Incorrect checkout amount"
         );
         self.policy_sequence = self
@@ -392,15 +453,57 @@ impl CoverageVault {
         let mandate = Mandate { supplier, limit };
         self.checkout = Some(Checkout {
             policy_id: id,
-            phase: CheckoutPhase::Booking,
+            phase: if self.rolling {
+                CheckoutPhase::CheckingBalance
+            } else {
+                CheckoutPhase::Booking
+            },
             mandate,
+            coverage_limit,
+            wallet_funding,
+            premium,
         });
-        self.pool_call(
-            "reserve_policy",
-            near_sdk::serde_json::json!({ "policy_id": id }),
-            12,
-        )
-        .then(
+        if self.rolling {
+            return self.wallet_balance().then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(125))
+                    .finish_checkout_balance(),
+            );
+        }
+        self.book_checkout()
+    }
+
+    #[private]
+    pub fn finish_checkout_balance(
+        &mut self,
+        #[callback_result] balance: Result<NearToken, PromiseError>,
+    ) -> Promise {
+        let checkout = self.checkout.as_mut().expect("Missing checkout");
+        assert!(
+            checkout.phase == CheckoutPhase::CheckingBalance,
+            "No checkout balance check"
+        );
+        if balance.is_err()
+            || checkout.coverage_limit
+                > balance
+                    .unwrap()
+                    .saturating_add(checkout.wallet_funding)
+                    .saturating_sub(DEDUCTIBLE)
+        {
+            return self.refund_checkout(false);
+        }
+        checkout.phase = CheckoutPhase::Booking;
+        self.book_checkout()
+    }
+
+    fn book_checkout(&self) -> Promise {
+        let checkout = self.checkout.as_ref().expect("Missing checkout");
+        let args = if self.rolling {
+            near_sdk::serde_json::json!({"policy_id": checkout.policy_id, "limit": checkout.coverage_limit})
+        } else {
+            near_sdk::serde_json::json!({"policy_id": checkout.policy_id})
+        };
+        self.pool_call("reserve_policy", args, 16).then(
             Self::ext(env::current_account_id())
                 .with_static_gas(Gas::from_tgas(83))
                 .finish_booking(),
@@ -424,14 +527,16 @@ impl CoverageVault {
         }
         let id = checkout.policy_id;
         let mandate = &checkout.mandate;
+        let args = if self.rolling {
+            near_sdk::serde_json::json!({"policy_id": id, "mandate": mandate, "funding": checkout.wallet_funding})
+        } else {
+            near_sdk::serde_json::json!({"policy_id": id, "mandate": mandate})
+        };
         Promise::new(self.wallet.clone())
             .function_call(
                 "fund_checkout",
-                near_sdk::serde_json::to_vec(
-                    &near_sdk::serde_json::json!({ "policy_id": id, "mandate": mandate }),
-                )
-                .expect("Policy ID"),
-                WALLET_FUNDING,
+                near_sdk::serde_json::to_vec(&args).expect("Policy ID"),
+                checkout.wallet_funding,
                 Gas::from_tgas(12),
             )
             .then(
@@ -458,6 +563,10 @@ impl CoverageVault {
         self.policy = Some(Policy {
             id: checkout.policy_id,
             activation_height: env::block_height(),
+            coverage_limit: checkout.coverage_limit,
+            limit_changes: Vec::new(),
+            paid_premiums: [checkout.premium, ZERO, ZERO, ZERO],
+            claim_limit: checkout.coverage_limit,
             phase: Phase::Active,
             votes: 0,
             loss: NearToken::from_yoctonear(0),
@@ -490,6 +599,7 @@ impl CoverageVault {
     }
 
     pub fn close_policy(&mut self, policy_id: u32) -> Promise {
+        self.assert_no_increase();
         let deadline = self.filing_deadline().expect("No policy");
         let policy = self.policy.as_mut().expect("No policy");
         assert_eq!(policy.id, policy_id, "Wrong policy");
@@ -588,16 +698,24 @@ impl CoverageVault {
         false
     }
 
-    fn checkout_total() -> NearToken {
-        PREMIUM
-            .checked_add(WALLET_FUNDING)
-            .expect("Checkout amount overflow")
+    fn premium_for(&self, limit: NearToken) -> NearToken {
+        if self.rolling {
+            NearToken::from_yoctonear(limit.as_yoctonear().div_ceil(40))
+        } else {
+            PREMIUM
+        }
     }
 
     fn refund_checkout(&mut self, retry: bool) -> Promise {
-        self.checkout.as_mut().expect("Missing checkout").phase = CheckoutPhase::Refunding;
+        let checkout = self.checkout.as_mut().expect("Missing checkout");
+        checkout.phase = CheckoutPhase::Refunding;
         Promise::new(self.owner.clone())
-            .transfer(Self::checkout_total())
+            .transfer(
+                checkout
+                    .premium
+                    .checked_add(checkout.wallet_funding)
+                    .expect("Checkout overflow"),
+            )
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(12))
@@ -747,13 +865,15 @@ impl CoverageVault {
             policy.id == policy_id && policy.phase == Phase::Active,
             "Active policy required"
         );
+        self.assert_no_increase();
+        let premium = self.premium_for(policy.current_limit());
         let window = self.coverage().payable_window.expect("No premium due");
         self.renewal = Some(window);
         Promise::new(self.wallet.clone())
             .function_call(
                 "send_premium",
                 near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
-                    "policy_id": policy_id, "window": window, "amount": PREMIUM,
+                    "policy_id": policy_id, "window": window, "amount": premium,
                 }))
                 .expect("Premium parameters"),
                 NearToken::from_yoctonear(0),
@@ -773,7 +893,8 @@ impl CoverageVault {
             self.wallet,
             "Wallet required"
         );
-        assert_eq!(env::attached_deposit(), PREMIUM, "Incorrect premium");
+        let premium = self.premium_for(self.policy.as_ref().expect("No policy").current_limit());
+        assert_eq!(env::attached_deposit(), premium, "Incorrect premium");
         assert_eq!(self.renewal, Some(window), "No matching pending premium");
         assert!(!self.paused, "Wallet paused");
         let policy = self.policy.as_mut().expect("No policy");
@@ -790,6 +911,7 @@ impl CoverageVault {
         );
         assert!(policy.windows[index].is_none(), "Premium already paid");
         policy.windows[index] = Some(start.max(now));
+        policy.paid_premiums[index] = premium;
     }
 
     #[private]
@@ -806,12 +928,14 @@ impl CoverageVault {
     }
 
     pub fn pause_wallet(&mut self, policy_id: u32) {
+        self.assert_no_increase();
         self.assert_recovery_account(policy_id);
         self.paused = true;
         self.agent = None;
     }
 
     pub fn resume_wallet(&mut self, policy_id: u32) {
+        self.assert_no_increase();
         self.assert_recovery_account(policy_id);
         self.assert_can_resume();
         assert!(self.renewal.is_none(), "Premium pending");
@@ -844,6 +968,7 @@ impl CoverageVault {
     }
 
     pub fn recover_wallet(&mut self, policy_id: u32) -> Promise {
+        self.assert_no_increase();
         self.assert_recovery_account(policy_id);
         assert!(
             self.paused && !self.recovery_pending && self.retired_at_ms.is_none(),
@@ -895,7 +1020,7 @@ impl CoverageVault {
         let window = self.unused_window().expect("No refundable premium");
         self.premium_refund_pending = true;
         Promise::new(self.beneficiary.clone())
-            .transfer(PREMIUM)
+            .transfer(policy.paid_premiums[window])
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(12))
@@ -909,7 +1034,9 @@ impl CoverageVault {
         if env::promise_result_checked(0, 0).is_err() {
             return false;
         }
-        self.policy.as_mut().expect("No policy").windows[usize::from(window)] = None;
+        let policy = self.policy.as_mut().expect("No policy");
+        policy.windows[usize::from(window)] = None;
+        policy.paid_premiums[usize::from(window)] = ZERO;
         true
     }
 
@@ -983,6 +1110,7 @@ impl CoverageVault {
             retired: self.retired_at_ms.is_some(),
             unused_premium: !self.premium_refund_pending && self.unused_window().is_some(),
             filing_deadline: self.filing_deadline(),
+            term_end: self.policy.as_ref().map(|policy| self.term_end(policy)),
             retired_at_ms: self.retired_at_ms,
             window_seconds: self.window_seconds,
         }
@@ -999,6 +1127,7 @@ impl CoverageVault {
     }
 
     pub fn submit_claim(&mut self, policy_id: u32) -> Promise {
+        self.assert_no_increase();
         let caller = env::predecessor_account_id();
         if caller != self.beneficiary && caller != self.owner {
             self.assert_connected_agent();
@@ -1040,11 +1169,12 @@ impl CoverageVault {
         if let Ok(Some(incident)) = result {
             if incident.policy_id == policy.id && incident.amount > DEDUCTIBLE {
                 policy.loss = incident.amount;
+                policy.claim_limit = policy.limit_at(incident.block_height);
                 policy.payout = incident
                     .amount
                     .checked_sub(DEDUCTIBLE)
                     .expect("Deductible")
-                    .min(LIMIT);
+                    .min(policy.claim_limit);
                 policy.incident = Some(incident);
                 policy.phase = Phase::InReview;
                 policy.review_deadline = Some(Self::now() + u64::from(self.review_seconds));
@@ -1095,6 +1225,11 @@ impl CoverageVault {
             approve, covered,
             "Vote does not match coverage at transfer time"
         );
+        let recovery = self
+            .claim_recoveries
+            .get(&policy_id)
+            .cloned()
+            .unwrap_or_default();
         let policy = self.policy.as_mut().expect("No policy");
         if let Some(previous) = &policy.evidence {
             assert!(
@@ -1102,6 +1237,8 @@ impl CoverageVault {
                 "Reviewers must attest to the same receipt"
             );
         } else {
+            policy.claim_limit = policy.limit_at(evidence.block_height);
+            policy.payout = recovery.payout(policy.loss, policy.claim_limit);
             policy.evidence = Some(evidence);
         }
         let vote = 1 << reviewer;
@@ -1177,7 +1314,11 @@ impl CoverageVault {
                 "Claim must be in review, approved, or paid"
             );
             recovery.record(env::attached_deposit(), Some(policy.loss));
-            policy.payout = recovery.payout(policy.loss);
+            if let Some(claim) = &policy.observed_claim {
+                policy.claim_limit =
+                    policy.observed_claim_limit(&claim.transfers, recovery.recovered_before_payout);
+            }
+            policy.payout = recovery.payout(policy.loss, policy.claim_limit);
         }
         self.claim_recoveries.insert(policy_id, recovery.clone());
         recovery

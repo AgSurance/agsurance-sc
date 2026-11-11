@@ -4,6 +4,8 @@ use near_sdk::PromiseError;
 const MAX_COHORT_CAPITAL: u128 = 100_000;
 const UNIT: u128 = NearToken::from_millinear(1).as_yoctonear();
 const BPS: u128 = 10_000;
+const SHARE_SCALE: u128 = 1_000;
+const MAX_SHARES: u128 = 1_000_000_000_000;
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub(super) struct CapitalPilot {
     closed: bool,
     units: u128,
     providers: LookupMap<AccountId, u128>,
+    contributions: LookupMap<AccountId, NearToken>,
+    contributed: NearToken,
     claimed: LookupMap<AccountId, NearToken>,
     credited_policies: LookupMap<(AccountId, u32), ()>,
     credits: LookupMap<AccountId, NearToken>,
@@ -55,6 +59,7 @@ pub struct CapitalStatus {
     sealed: bool,
     closed: bool,
     capital_raised: NearToken,
+    pool_equity: NearToken,
     claims_paid: NearToken,
     premium_income: NearToken,
     staking_income: NearToken,
@@ -63,12 +68,15 @@ pub struct CapitalStatus {
     validator_state: ValidatorState,
     withdrawable_income: NearToken,
     account_share: Option<CapitalShare>,
+    rolling: bool,
+    accepting_deposits: bool,
 }
 
 #[near(serializers = [json])]
 struct CapitalShare {
     principal_contributed: NearToken,
-    claim_payouts: NearToken,
+    claim_payouts: Option<NearToken>,
+    equity: NearToken,
     premiums: NearToken,
     staking_rewards: NearToken,
 }
@@ -100,6 +108,8 @@ impl CapitalPilot {
             closed: false,
             units: 0,
             providers: LookupMap::new(&b"capital:providers"[..]),
+            contributions: LookupMap::new(&b"capital:contributions"[..]),
+            contributed: ZERO,
             claimed: LookupMap::new(&b"capital:claimed"[..]),
             credited_policies: LookupMap::new(&b"capital:policies"[..]),
             credits: LookupMap::new(&b"capital:credits"[..]),
@@ -115,6 +125,10 @@ impl CapitalPilot {
             withdrawal: ZERO,
             withdrawal_baseline: ZERO,
         }
+    }
+
+    pub(super) fn is_unfunded(&self) -> bool {
+        self.units == 0 && !self.closed
     }
 
     pub(super) fn can_issue(&self) -> bool {
@@ -196,23 +210,63 @@ impl ReservePool {
     #[payable]
     pub fn fund_capital_pilot(&mut self) {
         let pilot = self.capital.as_mut().expect("Configure the capital pilot");
-        assert!(!pilot.sealed, "Capital cohort is sealed");
+        let rolling = self.limits.is_some();
+        assert!(
+            !pilot.closed && (rolling || !pilot.sealed),
+            "Capital cohort is sealed"
+        );
+        if rolling {
+            assert!(
+                self.pending == ZERO && pilot.validator_state == ValidatorState::Idle,
+                "Reconcile payouts or staking before accepting deposits"
+            );
+        }
         let amount = env::attached_deposit();
         let yocto = amount.as_yoctonear();
         assert!(
             yocto >= UNIT && yocto % UNIT == 0,
             "Deposit a whole number of milliNEAR"
         );
-        let units = yocto / UNIT;
+        let deposited = yocto / UNIT;
         assert!(
-            units <= MAX_COHORT_CAPITAL * 1000 - pilot.units,
+            pilot.contributed.as_yoctonear() / UNIT + deposited <= MAX_COHORT_CAPITAL * 1000,
             "Pilot capital cap exceeded"
         );
-        *pilot
-            .providers
-            .entry(env::predecessor_account_id())
-            .or_insert(0) += units;
+        let units = if rolling && pilot.units > 0 {
+            let nav = self
+                .assets
+                .checked_add(pilot.premium_income)
+                .and_then(|amount| amount.checked_add(pilot.staking_income))
+                .expect("Pool equity overflow");
+            assert!(
+                nav > ZERO,
+                "Close a depleted pool before accepting new capital"
+            );
+            // Round the price against the depositor to avoid diluting existing shares.
+            pilot.units * deposited / nav.as_yoctonear().div_ceil(UNIT)
+        } else if rolling {
+            deposited * SHARE_SCALE
+        } else {
+            deposited
+        };
+        assert!(
+            units > 0 && pilot.units + units <= MAX_SHARES,
+            "Contribution outside share bounds"
+        );
+        let account = env::predecessor_account_id();
+        *pilot.providers.entry(account.clone()).or_insert(0) += units;
+        let contribution = pilot.contributions.entry(account).or_insert(ZERO);
+        *contribution = contribution
+            .checked_add(amount)
+            .expect("Contribution overflow");
+        pilot.contributed = pilot
+            .contributed
+            .checked_add(amount)
+            .expect("Contribution overflow");
         pilot.units += units;
+        if rolling {
+            pilot.sealed = true;
+        }
         self.assets = self.assets.checked_add(amount).expect("Assets overflow");
     }
 
@@ -228,7 +282,7 @@ impl ReservePool {
 
     pub fn capital_status(&self, account_id: Option<AccountId>) -> Option<CapitalStatus> {
         let pilot = self.capital.as_ref()?;
-        let capital_raised = NearToken::from_yoctonear(pilot.units * UNIT);
+        let capital_raised = pilot.contributed;
         let principal = if pilot.closed {
             pilot.distributable_principal
         } else {
@@ -236,6 +290,7 @@ impl ReservePool {
                 .checked_add(pilot.principal_delegated)
                 .expect("Principal overflow")
         };
+        let rolling = self.limits.is_some();
         Some(CapitalStatus {
             validator: pilot.validator.clone(),
             buffer: pilot.buffer,
@@ -249,7 +304,17 @@ impl ReservePool {
             delegation_cap: pilot.delegation_cap,
             sealed: pilot.sealed,
             closed: pilot.closed,
+            rolling,
+            accepting_deposits: !pilot.closed
+                && if rolling {
+                    self.pending == ZERO && pilot.validator_state == ValidatorState::Idle
+                } else {
+                    !pilot.sealed
+                },
             capital_raised,
+            pool_equity: principal
+                .saturating_add(pilot.premium_income)
+                .saturating_add(pilot.staking_income),
             claims_paid: pilot.claims_paid,
             premium_income: pilot.premium_income,
             staking_income: pilot.staking_income,
@@ -260,8 +325,16 @@ impl ReservePool {
                 .as_ref()
                 .and_then(|id| pilot.providers.get(id))
                 .map(|units| CapitalShare {
-                    principal_contributed: NearToken::from_yoctonear(*units * UNIT),
-                    claim_payouts: share(pilot.claims_paid, *units, pilot.units),
+                    principal_contributed: pilot
+                        .contributions
+                        .get(account_id.as_ref().expect("Provider account"))
+                        .copied()
+                        .unwrap_or(ZERO),
+                    claim_payouts: (!rolling)
+                        .then(|| share(pilot.claims_paid, *units, pilot.units)),
+                    equity: share(principal, *units, pilot.units)
+                        .saturating_add(share(pilot.premium_income, *units, pilot.units))
+                        .saturating_add(share(pilot.staking_income, *units, pilot.units)),
                     premiums: share(pilot.premium_income, *units, pilot.units),
                     staking_rewards: share(pilot.staking_income, *units, pilot.units),
                 }),

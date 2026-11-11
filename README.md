@@ -1,8 +1,10 @@
 # AgSurance contracts
 
-AgSurance uses three Rust contracts on NEAR testnet. The wallet holds the agent's spending funds. The vault manages coverage, claims, and recovery. The reserve holds the funds that pay approved claims and supports an optional capital pilot.
+AgSurance runs on NEAR testnet. The wallet holds the agent's spending funds, the vault manages coverage and claims, and the reserve holds the capital for approved payouts. The public demo uses a factory to deploy a wallet and vault for each buyer.
 
-[Run the local demo](https://github.com/AgSurance/agsurance-fe#run-the-testnet-demo) · [Open the public replay](https://agsurance.github.io/agsurance-fe/)
+[Try the live shared-reserve demo](https://agsurance-judge-preview.vercel.app/demo#manual-demo) · [0.18 NEAR payout](https://testnet.nearblocks.io/txns/7bNezR6hT22Bm2MCeSPc59BC2ehBaYSExTQdqn98MRYP/receipts) · [Run the local demo](https://github.com/AgSurance/agsurance-fe#run-the-testnet-demo) · [Open the public replay](https://agsurance.github.io/agsurance-fe/)
+
+A second capital deposit opened capacity for a previously blocked checkout. The first policy kept its 0.18 NEAR limit until the owner raised it to 0.42 NEAR. The reserve paid 0.18 NEAR for a covered loss that occurred before the increase. [Capital deposit](https://testnet.nearblocks.io/txns/81QPfbkG2uhDAKc5HL4NhUCqMJijAd1wkHqdfoGQQ49U/receipts) · [Limit increase](https://testnet.nearblocks.io/txns/CL3ko61db2p4Mw2tZaLEaj9hPWLaXZpW3tipt7CyrkNV/receipts) · [0.18 NEAR payout](https://testnet.nearblocks.io/txns/7bNezR6hT22Bm2MCeSPc59BC2ehBaYSExTQdqn98MRYP/receipts)
 
 ## System diagram
 
@@ -31,9 +33,10 @@ flowchart LR
 | --- | --- |
 | [`agent-wallet`](contracts/agent-wallet/src/lib.rs) | The spending balance, approved supplier, spending limit, and balance recovery. |
 | [`coverage-vault`](contracts/coverage-vault/src/lib.rs) | Policy purchase, paid periods, agent access, and claim review. |
-| [`reserve-pool`](contracts/reserve-pool/src/lib.rs) | Reserve funds, the amount set aside for each policy, and claim transfers. |
+| [`reserve-pool`](contracts/reserve-pool/src/lib.rs) | Capital deposits, policy allocations, exposure caps, and claim payouts. |
+| [`manual-demo-factory`](contracts/manual-demo-factory/src/lib.rs) | Provisions buyer wallets and vaults and registers them with the reserve. |
 
-## Open a policy and grant access
+## Open a fixed-limit replay policy and grant access
 
 A callback is a method that receives the result of an earlier call. The vault uses callbacks because NEAR processes calls between contracts in separate steps.
 
@@ -90,6 +93,25 @@ cargo build --locked --release --target wasm32-unknown-unknown
 ```
 
 The build writes the WebAssembly files to `target/wasm32-unknown-unknown/release`. Use a fresh deployment for this contract state. The frontend setup script deploys the three contracts to named testnet accounts without account access keys. Follow the [frontend setup instructions](https://github.com/AgSurance/agsurance-fe#run-the-testnet-demo).
+
+## Manual demo factory
+
+Build the wallet and vault with the standard command above, then embed those binaries in the factory.
+
+```sh
+wasm_dir="$PWD/target/wasm32-unknown-unknown/release"
+AGSURANCE_WALLET_WASM="$wasm_dir/agent_wallet.wasm" \
+AGSURANCE_VAULT_WASM="$wasm_dir/coverage_vault.wasm" \
+cargo build --locked --release --target wasm32-unknown-unknown -p manual-demo-factory
+```
+
+Deploy the factory to a named testnet account with at most 24 characters. Use a **fresh** reserve and factory. Keep the reserve operator account separate from the factory registrar. Initialize the reserve with `new({ operator })`, then have the operator call `configure_capital_pilot` and `configure_rolling_limits({ max_policy, max_group, registrar })`. Set `registrar` to the factory account. All amounts are yoctoNEAR. Initialize the factory with the reserve, the wallet code hash, three distinct reviewer accounts, a runner, a test incident recipient, and a `risk_group` shared by vaults that use the same wallet runtime. Seed the reserve via `fund_capital_pilot` to receive capital shares. The first deposit enables issuance when capacity is sufficient.
+
+The reserve locks the quoted payout limit and keeps the configured buffer liquid. It enforces both underwriting caps on purchases and increases. The vault charges 2.5% of the limit per weekly testnet window, rounded up to the next yoctoNEAR, with a 0.05 NEAR deductible and a 0.001 NEAR minimum limit. An increase charges the fee difference for the current window and any already-paid later windows. Claims use the limit in effect at the transfer block.
+
+Later deposits buy shares at current pool equity (liquid assets plus booked provider earnings when the validator is idle). They share all future payouts, including claims on policies already active. Previously paid losses are reflected in the entry price. Deposits pause while payouts or validator funds are in flight; only surplus beyond existing allocations and the buffer may be delegated. Legacy deployments retain their fixed pilot and checkout terms. Use fresh testnet accounts for the shared reserve; the new WASM uses a different storage layout.
+
+A buyer calls `setup_deposit` for the storage amount and signs `prepare` with at least 255 Tgas. The factory creates the wallet and vault without full-access keys and registers the buyer as the recovery account. When `setup` reports `Ready`, the buyer signs `buy_policy` on the new vault. If setup stops after a failed receipt, call `prepare` again without another deposit.
 
 ## What to test
 

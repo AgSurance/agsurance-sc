@@ -35,6 +35,29 @@ fn is_chain_hash(hash: &str) -> bool {
     )
 }
 
+impl Policy {
+    pub(super) fn observed_claim_limit(
+        &self,
+        transfers: &[TransferEvidence],
+        recovered: NearToken,
+    ) -> NearToken {
+        let mut cap = self.current_limit();
+        let mut previous_limit = self.coverage_limit;
+        for change in &self.limit_changes {
+            let later_loss = transfers
+                .iter()
+                .filter(|transfer| transfer.receipt.block_height >= change.effective_height)
+                .fold(ZERO, |sum, transfer| {
+                    sum.saturating_add(transfer.receipt.amount)
+                });
+            // Unattributed recoveries reduce the most recent losses first.
+            cap = cap.min(previous_limit.saturating_add(later_loss.saturating_sub(recovered)));
+            previous_limit = change.limit;
+        }
+        cap
+    }
+}
+
 #[near]
 impl CoverageVault {
     pub fn confirm_vendor_change(
@@ -81,6 +104,7 @@ impl CoverageVault {
         policy_id: u32,
         transfers: Vec<TransferEvidence>,
     ) -> String {
+        self.assert_no_increase();
         let caller = env::predecessor_account_id();
         if caller != self.owner && caller != self.beneficiary {
             self.assert_connected_agent();
@@ -148,9 +172,11 @@ impl CoverageVault {
             .expect("Evidence encoding"),
         );
         let evidence_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let claim_limit = policy.observed_claim_limit(&transfers, ZERO);
         let policy = self.policy.as_mut().expect("No policy");
         policy.loss = loss;
-        policy.payout = loss.saturating_sub(DEDUCTIBLE).min(LIMIT);
+        policy.claim_limit = claim_limit;
+        policy.payout = loss.saturating_sub(DEDUCTIBLE).min(claim_limit);
         policy.phase = Phase::InReview;
         policy.review_deadline = Some(Self::now() + u64::from(self.review_seconds));
         policy.observed_claim = Some(ObservedClaim {

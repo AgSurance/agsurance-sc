@@ -68,19 +68,16 @@ impl AgentWallet {
     }
 
     #[payable]
-    pub fn fund_checkout(&mut self, policy_id: u32, mandate: Mandate) {
+    pub fn fund_checkout(&mut self, policy_id: u32, mandate: Mandate, funding: Option<NearToken>) {
         assert_eq!(env::predecessor_account_id(), self.vault, "Vault required");
-        assert_eq!(
-            env::attached_deposit(),
-            CHECKOUT_FUNDING,
-            "Incorrect wallet funding"
-        );
+        let funding = funding.unwrap_or(CHECKOUT_FUNDING);
+        assert_eq!(env::attached_deposit(), funding, "Incorrect wallet funding");
         assert!(policy_id > self.funded_policy_id, "Policy already funded");
         self.assert_idle();
         assert!(!self.recovery_started, "Wallet is in recovery");
         self.operating_balance = self
             .operating_balance
-            .checked_add(CHECKOUT_FUNDING)
+            .checked_add(funding)
             .expect("Operating balance");
         self.funded_policy_id = policy_id;
         self.mandate = Some(mandate);

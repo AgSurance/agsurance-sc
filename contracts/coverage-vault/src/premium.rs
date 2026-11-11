@@ -26,9 +26,10 @@ impl CoverageVault {
                 && self.unused_window().is_none(),
             "Reconcile premiums and refunds first"
         );
-        let earned = policy.windows.iter().flatten().count() as u32;
-        let amount = PREMIUM
-            .checked_mul(u128::from(earned))
+        let amount = policy
+            .paid_premiums
+            .iter()
+            .try_fold(ZERO, |sum, amount| sum.checked_add(*amount))
             .expect("Premium overflow");
         let cashback_eligible = self.retired_at_ms.is_none()
             && policy.windows.iter().enumerate().all(|(index, start)| {

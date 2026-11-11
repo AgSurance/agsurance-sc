@@ -1,4 +1,4 @@
-use super::{DEDUCTIBLE, LIMIT};
+use super::DEDUCTIBLE;
 use near_sdk::{near, NearToken};
 
 #[near(serializers = [borsh, json])]
@@ -32,10 +32,10 @@ struct Settlement {
 }
 
 impl ClaimRecovery {
-    pub(super) fn payout(&self, loss: NearToken) -> NearToken {
+    pub(super) fn payout(&self, loss: NearToken, limit: NearToken) -> NearToken {
         loss.saturating_sub(self.recovered_before_payout)
             .saturating_sub(DEDUCTIBLE)
-            .min(LIMIT)
+            .min(limit)
     }
 
     pub(super) fn is_settled(&self) -> bool {
@@ -131,21 +131,21 @@ mod tests {
     fn actual_recovery_reduces_payout_before_applying_limit() {
         let mut claim = ClaimRecovery::default();
         claim.record(amount(50), Some(amount(300)));
-        assert_eq!(claim.payout(amount(300)), amount(200));
+        assert_eq!(claim.payout(amount(300), super::super::LIMIT), amount(200));
         assert_eq!(claim.beneficiary_claimable, amount(50));
 
         let mut capped = ClaimRecovery::default();
         capped.record(amount(50), Some(amount(600)));
-        assert_eq!(capped.payout(amount(600)), amount(400));
+        assert_eq!(capped.payout(amount(600), super::super::LIMIT), amount(400));
         capped.record(amount(510), Some(amount(600)));
-        assert!(capped.payout(amount(600)).is_zero());
+        assert!(capped.payout(amount(600), super::super::LIMIT).is_zero());
     }
 
     #[test]
     fn post_payout_recovery_follows_waterfall_across_deposits_and_retries() {
         let mut claim = ClaimRecovery::default();
         claim.record(amount(50), Some(amount(600)));
-        claim.settle(amount(600), claim.payout(amount(600)));
+        claim.settle(amount(600), claim.payout(amount(600), super::super::LIMIT));
         assert_eq!(
             claim.begin_distribution(RecoveryRecipient::Beneficiary),
             amount(50)
@@ -192,7 +192,7 @@ mod tests {
     fn cumulative_recovery_cannot_exceed_claimed_loss() {
         let mut claim = ClaimRecovery::default();
         claim.record(amount(50), Some(amount(300)));
-        claim.settle(amount(300), claim.payout(amount(300)));
+        claim.settle(amount(300), claim.payout(amount(300), super::super::LIMIT));
         claim.record(amount(251), None);
     }
 }
