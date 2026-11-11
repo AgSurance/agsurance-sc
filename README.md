@@ -50,6 +50,8 @@ The test function `simulate_loss` transfers 0.30 NEAR to a fixed test recipient.
 
 The reviewer client reads the finalized transfer receipt through NEAR RPC. The vault compares the submitted evidence with the recorded loss and the policy's spending rules. It uses the transfer time to determine whether coverage was active. Two of three reviewers must submit matching votes on the same receipt. The contract uses those votes to approve or reject the claim.
 
+New vaults initialized with `wallet_code_hash` also accept `submit_evidence_claim` from the owner, recovery account, or a permitted agent. It groups up to eight distinct transfer actions by receipt and action index, validates them against the policy's time windows and mandate, and applies one deductible. Each `vote_evidence_claim` is bound to the same evidence hash. Reviewers independently check the finalized receipts and the historical wallet code through NEAR RPC.
+
 After approval, `pay_claim` calls `settle_claim` on the pool. The pool pays the registered recovery account. `finish_transfer` records the transfer result. The vault marks the claim paid when `finish_payout` receives a paid result. If the transfer fails, the pool keeps the allocation for a retry. The pool records pending and paid transfers to prevent a second payout for the same policy. The standard 0.30 NEAR test loss pays 0.25 NEAR after the 0.05 NEAR deductible.
 
 The registered recovery account calls payable `record_claim_recovery` to attach NEAR recovered from the incident after any external recovery costs. A deposit of 0.05 NEAR before payout reduces the test payout to 0.20 NEAR. A zero payout settles the claim and releases its allocation.
@@ -61,6 +63,8 @@ For deposits after payout, the vault first credits the recovery account for loss
 The owner pays for the first coverage period during checkout. The agent can renew during the last day of a paid period or after a missed payment. A late payment starts coverage when the vault receives it. Each renewal costs 0.01 NEAR. The original policy limit applies across all four periods. The wallet's payable `top_up` method adds funds to the operating balance.
 
 The registered recovery account calls `pause_wallet` to stop new spending and revoke the old agent grant. Scheduled transfers settle independently. To keep the wallet, register a fresh public key through `rotate_agent` with 0.10 NEAR. Call `resume_wallet` after the replacement grant is confirmed and any pending premium has settled.
+
+Before checkout, the owner can register a separate beneficiary with `choose_recovery_account`. The reserve confirms and locks that payout destination. The supplier can use `confirm_vendor_change` to record an expiring confirmation of a new address for use in a future checkout. The current mandate remains in force for the term.
 
 To retire the wallet, call `recover_wallet` to move the operating balance to the registered recovery account. Starting the transfer disables resumption. The account can retry a failed transfer, file a claim for a covered loss before retirement, and use `refund_unused_premium` to recover a prepaid period that had yet to begin.
 
@@ -74,7 +78,7 @@ Capital providers fund a cohort that the operator seals before issuing policies.
 
 After a policy ends and its claim or reserve allocation has settled, the vault can call `settle_earned_premiums`. The standard pilot configuration credits 20% cashback to the owner of a fully paid term without a coverage gap, then assigns 70% of the remaining earned premium to the cohort and the balance to the operator.
 
-Providers claim their proportional principal and earnings after the cohort closes. The pool also tracks their shares of paid claims. The recovery, premium, and cashback flows passed in NEAR Sandbox. The staking flow used a simulated validator. [Pilot setup and operation](https://github.com/AgSurance/agsurance-fe#optional-capital-pilot)
+Providers claim their proportional principal and earnings after the cohort closes. The pool also tracks their shares of paid claims. The recovery, premium, and cashback flows passed in NEAR Sandbox. The sandbox tested the full staking flow with a simulated validator. A separate live testnet pool delegated 0.05 NEAR and reached unbonding. Withdrawal and rewards are pending. [Pilot setup and operation](https://github.com/AgSurance/agsurance-fe#optional-capital-pilot)
 
 ## Build the contracts
 

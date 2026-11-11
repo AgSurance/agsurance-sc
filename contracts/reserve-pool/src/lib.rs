@@ -1,4 +1,4 @@
-use near_sdk::store::LookupMap;
+use near_sdk::store::{LookupMap, LookupSet};
 use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue};
 
 mod capital;
@@ -43,6 +43,7 @@ pub struct ReservePool {
     quarantined: NearToken,
     capital: Option<CapitalPilot>,
     open_premium_accounts: u32,
+    beneficiary_locked: LookupSet<AccountId>,
 }
 
 #[near]
@@ -60,6 +61,7 @@ impl ReservePool {
             quarantined: ZERO,
             capital: None,
             open_premium_accounts: 0,
+            beneficiary_locked: LookupSet::new(b"b"),
         }
     }
 
@@ -99,6 +101,27 @@ impl ReservePool {
         self.recipients.insert(vault, beneficiary);
     }
 
+    pub fn set_initial_beneficiary(&mut self, beneficiary: AccountId) {
+        let vault = env::predecessor_account_id();
+        assert!(
+            self.recipients.contains_key(&vault),
+            "Registered vault required"
+        );
+        if self.recipients.get(&vault) == Some(&beneficiary) {
+            return;
+        }
+        assert!(
+            !self.beneficiary_locked.contains(&vault),
+            "Beneficiary is locked"
+        );
+        assert!(
+            beneficiary.as_str().ends_with(".testnet") && beneficiary != env::current_account_id(),
+            "Invalid beneficiary"
+        );
+        self.beneficiary_locked.insert(vault.clone());
+        self.recipients.insert(vault, beneficiary);
+    }
+
     #[payable]
     pub fn fund_reserve(&mut self) {
         if self
@@ -134,7 +157,7 @@ impl ReservePool {
             self.recipients.contains_key(&vault),
             "Registered vault required"
         );
-        let key = (vault, policy_id);
+        let key = (vault.clone(), policy_id);
         if let Some(allocation) = self.allocations.get(&key) {
             return matches!(allocation, Allocation::Reserved);
         }
@@ -149,6 +172,7 @@ impl ReservePool {
             return false;
         }
         self.allocations.insert(key, Allocation::Reserved);
+        self.beneficiary_locked.insert(vault);
         self.locked = locked;
         if self.capital.is_some() {
             self.open_premium_accounts += 1;

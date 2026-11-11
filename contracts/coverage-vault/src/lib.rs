@@ -7,7 +7,10 @@ use near_sdk::{
     PromiseOrValue, PublicKey,
 };
 
+mod observed_claim;
 mod premium;
+mod recovery_account;
+use observed_claim::ObservedClaim;
 
 const REVIEW_SECONDS: u32 = 72 * 60 * 60;
 const CLAIM_SECONDS: u32 = 48 * 60 * 60;
@@ -75,6 +78,7 @@ struct Policy {
     mandate: Mandate,
     incident: Option<Incident>,
     evidence: Option<Evidence>,
+    observed_claim: Option<ObservedClaim>,
     windows: [Option<u64>; WINDOW_COUNT],
     review_deadline: Option<u64>,
     escalated_at: Option<u64>,
@@ -151,6 +155,9 @@ pub struct Dashboard {
     coverage: Coverage,
     chain_time: u64,
     wallet: AccountId,
+    wallet_code_hash: Option<String>,
+    recovery_choice_available: bool,
+    pending_beneficiary: Option<AccountId>,
 }
 
 #[near(contract_state)]
@@ -182,6 +189,11 @@ pub struct CoverageVault {
     premiums_distributed: bool,
     claim_recoveries: LookupMap<u32, ClaimRecovery>,
     payout_attempt_pending: bool,
+    wallet_code_hash: Option<String>,
+    used_transfer_actions: LookupSet<(String, u32)>,
+    vendor_confirmations: LookupMap<u32, observed_claim::VendorConfirmation>,
+    beneficiary_chosen: bool,
+    pending_beneficiary: Option<AccountId>,
 }
 
 #[near]
@@ -198,6 +210,7 @@ impl CoverageVault {
         test_review_seconds: Option<u32>,
         test_claim_seconds: Option<u32>,
         capital_pilot: Option<bool>,
+        wallet_code_hash: Option<String>,
     ) -> Self {
         assert!(env::current_account_id().as_str().ends_with(".testnet"));
         assert!(
@@ -263,6 +276,11 @@ impl CoverageVault {
             premiums_distributed: false,
             claim_recoveries: LookupMap::new(b"c"),
             payout_attempt_pending: false,
+            wallet_code_hash,
+            used_transfer_actions: LookupSet::new(b"t"),
+            vendor_confirmations: LookupMap::new(b"v"),
+            pending_beneficiary: None,
+            beneficiary_chosen: false,
         }
     }
 
@@ -308,6 +326,11 @@ impl CoverageVault {
             coverage: self.coverage(),
             chain_time: Self::now(),
             wallet: self.wallet.clone(),
+            wallet_code_hash: self.wallet_code_hash.clone(),
+            recovery_choice_available: !self.beneficiary_chosen
+                && self.policy_sequence == 0
+                && self.checkout.is_none(),
+            pending_beneficiary: self.pending_beneficiary.clone(),
         }
     }
 
@@ -337,6 +360,10 @@ impl CoverageVault {
             );
         }
         assert!(self.checkout.is_none(), "Checkout already pending");
+        assert!(
+            self.pending_beneficiary.is_none(),
+            "Recovery account confirmation pending"
+        );
         assert!(
             !self.capital_pilot || self.policy.is_none() || self.premiums_distributed,
             "Settle earned premiums first"
@@ -438,6 +465,7 @@ impl CoverageVault {
             mandate: checkout.mandate.clone(),
             incident: None,
             evidence: None,
+            observed_claim: None,
             windows: [Some(Self::now()), None, None, None],
             review_deadline: None,
             escalated_at: None,
@@ -629,7 +657,7 @@ impl CoverageVault {
                 public_key.clone(),
                 Allowance::limited(AGENT_FUNDING).expect("Nonzero allowance"),
                 vault.clone(),
-                "submit_claim,pay_supplier,pay_premium",
+                "submit_claim,submit_evidence_claim,pay_supplier,pay_premium",
             )
             .then(
                 Self::ext(vault)
@@ -1062,11 +1090,7 @@ impl CoverageVault {
             .expect("Transfer block timestamp required");
         let time = time_ms / 1000;
         assert!(time <= incident.recorded_at, "Transfer follows incident");
-        let covered = evidence.block_height >= policy.activation_height
-            && self.retired_at_ms.is_none_or(|retired| time_ms < retired)
-            && Self::window_at(policy, self.window_seconds, time)
-                .and_then(|window| policy.windows[window])
-                .is_some_and(|start| start <= time);
+        let covered = self.transfer_is_covered(policy, &evidence);
         assert_eq!(
             approve, covered,
             "Vote does not match coverage at transfer time"
@@ -1086,6 +1110,16 @@ impl CoverageVault {
         let count = policy.votes.count_ones();
         if count == 2 {
             policy.phase = if approve {
+                let receipt = policy
+                    .evidence
+                    .as_ref()
+                    .expect("Matching evidence")
+                    .receipt_id
+                    .clone();
+                assert!(
+                    self.used_transfer_actions.insert((receipt, 0)),
+                    "Transfer already claimed"
+                );
                 Phase::Approved
             } else {
                 Phase::Rejected
