@@ -1,8 +1,13 @@
-use near_sdk::store::LookupMap;
+mod claim_recovery;
+
+use claim_recovery::{ClaimRecovery, RecoveryRecipient};
+use near_sdk::store::{LookupMap, LookupSet};
 use near_sdk::{
     env, near, AccountId, Allowance, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
     PromiseOrValue, PublicKey,
 };
+
+mod premium;
 
 const REVIEW_SECONDS: u32 = 72 * 60 * 60;
 const CLAIM_SECONDS: u32 = 48 * 60 * 60;
@@ -111,6 +116,7 @@ struct Coverage {
     renewal_pending: bool,
     paused: bool,
     recovery_pending: bool,
+    migration_started: bool,
     retired: bool,
     unused_premium: bool,
     filing_deadline: Option<u64>,
@@ -134,6 +140,7 @@ pub struct Dashboard {
     limit: NearToken,
     deductible: NearToken,
     policy: Option<Policy>,
+    claim_recovery: Option<ClaimRecovery>,
     beneficiary: AccountId,
     owner: AccountId,
     agent: Option<Agent>,
@@ -157,6 +164,7 @@ pub struct CoverageVault {
     policy: Option<Policy>,
     agent: Option<Agent>,
     agent_sequence: u32,
+    agent_keys: LookupSet<PublicKey>,
     mandates: LookupMap<u32, Mandate>,
     checkout: Option<Checkout>,
     window_seconds: u32,
@@ -164,10 +172,16 @@ pub struct CoverageVault {
     renewal: Option<u8>,
     paused: bool,
     recovery_pending: bool,
+    migration_started: bool,
     retired_at_ms: Option<u64>,
     premium_refund_pending: bool,
     claim_seconds: u32,
     policy_sequence: u32,
+    capital_pilot: bool,
+    premiums_pending: bool,
+    premiums_distributed: bool,
+    claim_recoveries: LookupMap<u32, ClaimRecovery>,
+    payout_attempt_pending: bool,
 }
 
 #[near]
@@ -183,6 +197,7 @@ impl CoverageVault {
         reserve_pool: AccountId,
         test_review_seconds: Option<u32>,
         test_claim_seconds: Option<u32>,
+        capital_pilot: Option<bool>,
     ) -> Self {
         assert!(env::current_account_id().as_str().ends_with(".testnet"));
         assert!(
@@ -230,6 +245,7 @@ impl CoverageVault {
             policy: None,
             agent: None,
             agent_sequence: 0,
+            agent_keys: LookupSet::new(b"agent-keys".to_vec()),
             mandates: LookupMap::new(b"m"),
             checkout: None,
             window_seconds,
@@ -237,10 +253,16 @@ impl CoverageVault {
             renewal: None,
             paused: false,
             recovery_pending: false,
+            migration_started: false,
             retired_at_ms: None,
             premium_refund_pending: false,
             claim_seconds,
             policy_sequence: 0,
+            capital_pilot: capital_pilot.unwrap_or(false),
+            premiums_pending: false,
+            premiums_distributed: false,
+            claim_recoveries: LookupMap::new(b"c"),
+            payout_attempt_pending: false,
         }
     }
 
@@ -272,6 +294,10 @@ impl CoverageVault {
             limit: LIMIT,
             deductible: DEDUCTIBLE,
             policy: self.policy.clone(),
+            claim_recovery: self
+                .policy
+                .as_ref()
+                .and_then(|policy| self.claim_recovery(policy.id)),
             beneficiary: self.beneficiary.clone(),
             owner: self.owner.clone(),
             agent: self.agent.clone(),
@@ -311,6 +337,10 @@ impl CoverageVault {
             );
         }
         assert!(self.checkout.is_none(), "Checkout already pending");
+        assert!(
+            !self.capital_pilot || self.policy.is_none() || self.premiums_distributed,
+            "Settle earned premiums first"
+        );
         assert!(!self.paused && self.renewal.is_none(), "Wallet unavailable");
         assert!(
             self.agent.as_ref().is_none_or(|agent| agent.connected),
@@ -413,6 +443,7 @@ impl CoverageVault {
             escalated_at: None,
         });
         self.checkout = None;
+        self.premiums_distributed = false;
         PromiseOrValue::Value(true)
     }
 
@@ -549,18 +580,35 @@ impl CoverageVault {
     #[payable]
     pub fn connect_agent(&mut self, policy_id: u32, public_key: PublicKey) -> Promise {
         assert_eq!(env::predecessor_account_id(), self.owner, "Owner required");
-        assert_eq!(
-            env::attached_deposit(),
-            AGENT_FUNDING,
-            "Incorrect agent funding"
-        );
         let policy = self.policy.as_ref().expect("No policy");
         assert!(
             policy.id == policy_id && policy.phase == Phase::Active,
             "Active policy required"
         );
         assert!(!self.paused, "Wallet paused");
+        assert!(self.checkout.is_none(), "Checkout pending");
+        self.register_agent(public_key)
+    }
+
+    #[payable]
+    pub fn rotate_agent(&mut self, policy_id: u32, public_key: PublicKey) -> Promise {
+        self.assert_recovery_account(policy_id);
+        self.assert_can_resume();
+        self.register_agent(public_key)
+    }
+
+    fn register_agent(&mut self, public_key: PublicKey) -> Promise {
+        assert_eq!(
+            env::attached_deposit(),
+            AGENT_FUNDING,
+            "Incorrect agent funding"
+        );
         assert!(self.agent.is_none(), "Agent already connected or pending");
+        assert!(
+            self.agent_keys.insert(public_key.clone()),
+            "Fresh agent key required"
+        );
+        let funder = env::predecessor_account_id();
         self.agent_sequence = self
             .agent_sequence
             .checked_add(1)
@@ -574,11 +622,11 @@ impl CoverageVault {
             public_key: public_key.clone(),
             connected: false,
         });
-        Promise::new(account_id)
+        Promise::new(account_id.clone())
             .create_account()
             .transfer(AGENT_FUNDING)
             .add_access_key_allowance(
-                public_key,
+                public_key.clone(),
                 Allowance::limited(AGENT_FUNDING).expect("Nonzero allowance"),
                 vault.clone(),
                 "submit_claim,pay_supplier,pay_premium",
@@ -586,23 +634,36 @@ impl CoverageVault {
             .then(
                 Self::ext(vault)
                     .with_static_gas(Gas::from_tgas(16))
-                    .finish_connect_agent(),
+                    .finish_connect_agent(account_id, public_key, funder),
             )
     }
 
     #[private]
-    pub fn finish_connect_agent(&mut self) -> bool {
-        let agent = self.agent.as_mut().expect("No pending agent");
-        assert!(!agent.connected, "Agent is already connected");
-        if env::promise_result_checked(0, 0).is_err() {
-            self.agent = None;
-            Promise::new(self.owner.clone())
-                .transfer(AGENT_FUNDING)
-                .detach();
-            return false;
+    pub fn finish_connect_agent(
+        &mut self,
+        account_id: AccountId,
+        public_key: PublicKey,
+        funder: AccountId,
+    ) -> bool {
+        let created = env::promise_result_checked(0, 0).is_ok();
+        if !created {
+            self.agent_keys.remove(&public_key);
+            Promise::new(funder).transfer(AGENT_FUNDING).detach();
         }
-        agent.connected = true;
-        true
+        // Pause can revoke an in-flight registration before account creation completes.
+        let Some(agent) = self
+            .agent
+            .as_mut()
+            .filter(|agent| agent.account_id == account_id)
+        else {
+            return false;
+        };
+        if created {
+            agent.connected = true;
+        } else {
+            self.agent = None;
+        }
+        created
     }
 
     #[payable]
@@ -717,6 +778,23 @@ impl CoverageVault {
     }
 
     pub fn pause_wallet(&mut self, policy_id: u32) {
+        self.assert_recovery_account(policy_id);
+        self.paused = true;
+        self.agent = None;
+    }
+
+    pub fn resume_wallet(&mut self, policy_id: u32) {
+        self.assert_recovery_account(policy_id);
+        self.assert_can_resume();
+        assert!(self.renewal.is_none(), "Premium pending");
+        assert!(
+            self.agent.as_ref().is_some_and(|agent| agent.connected),
+            "Replacement agent not connected"
+        );
+        self.paused = false;
+    }
+
+    fn assert_recovery_account(&self, policy_id: u32) {
         assert_eq!(
             env::predecessor_account_id(),
             self.beneficiary,
@@ -728,31 +806,25 @@ impl CoverageVault {
             "Wrong policy"
         );
         assert!(self.checkout.is_none(), "Checkout pending");
+    }
+
+    fn assert_can_resume(&self) {
         assert!(
-            self.agent.as_ref().is_none_or(|agent| agent.connected),
-            "Agent connection pending"
+            self.paused && !self.migration_started && self.retired_at_ms.is_none(),
+            "Wallet cannot be resumed"
         );
-        self.paused = true;
-        self.agent = None;
     }
 
     pub fn recover_wallet(&mut self, policy_id: u32) -> Promise {
-        assert_eq!(
-            env::predecessor_account_id(),
-            self.beneficiary,
-            "Recovery account required"
-        );
+        self.assert_recovery_account(policy_id);
         assert!(
             self.paused && !self.recovery_pending && self.retired_at_ms.is_none(),
             "Wallet cannot be recovered"
         );
         assert!(self.renewal.is_none(), "Premium pending");
-        assert_eq!(
-            self.policy.as_ref().map(|policy| policy.id),
-            Some(policy_id),
-            "Wrong policy"
-        );
+        self.migration_started = true;
         self.recovery_pending = true;
+        self.agent = None;
         Promise::new(self.wallet.clone())
             .function_call(
                 "recover_balance",
@@ -879,6 +951,7 @@ impl CoverageVault {
             renewal_pending: self.renewal.is_some(),
             paused: self.paused,
             recovery_pending: self.recovery_pending,
+            migration_started: self.migration_started,
             retired: self.retired_at_ms.is_some(),
             unused_premium: !self.premium_refund_pending && self.unused_window().is_some(),
             filing_deadline: self.filing_deadline(),
@@ -1038,12 +1111,91 @@ impl CoverageVault {
         policy.escalated_at = Some(now);
     }
 
+    pub fn claim_recovery(&self, policy_id: u32) -> Option<ClaimRecovery> {
+        self.claim_recoveries.get(&policy_id).cloned().or_else(|| {
+            self.policy
+                .as_ref()
+                .filter(|policy| policy.id == policy_id)
+                .map(|_| ClaimRecovery::default())
+        })
+    }
+
+    // Record only the NEAR actually returned to this claim after external recovery costs.
+    // Remaining wallet balance is not incident recovery.
+    #[payable]
+    pub fn record_claim_recovery(&mut self, policy_id: u32) -> ClaimRecovery {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.beneficiary,
+            "Recovery account required"
+        );
+        let mut recovery = self
+            .claim_recoveries
+            .get(&policy_id)
+            .cloned()
+            .unwrap_or_default();
+        if recovery.is_settled() {
+            recovery.record(env::attached_deposit(), None);
+        } else {
+            let policy = self.policy.as_mut().expect("No policy");
+            assert!(
+                policy.id == policy_id && matches!(policy.phase, Phase::InReview | Phase::Approved),
+                "Claim must be in review, approved, or paid"
+            );
+            recovery.record(env::attached_deposit(), Some(policy.loss));
+            policy.payout = recovery.payout(policy.loss);
+        }
+        self.claim_recoveries.insert(policy_id, recovery.clone());
+        recovery
+    }
+
+    pub fn distribute_claim_recovery(
+        &mut self,
+        policy_id: u32,
+        recipient: RecoveryRecipient,
+    ) -> Promise {
+        let recovery = self
+            .claim_recoveries
+            .get_mut(&policy_id)
+            .expect("No claim recovery");
+        let amount = recovery.begin_distribution(recipient);
+        let distribution =
+            match recipient {
+                RecoveryRecipient::Beneficiary => {
+                    Promise::new(self.beneficiary.clone()).transfer(amount)
+                }
+                RecoveryRecipient::Reserve => Promise::new(self.reserve_pool.clone())
+                    .function_call("fund_reserve", b"{}".to_vec(), amount, Gas::from_tgas(15)),
+            };
+        distribution.then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(Gas::from_tgas(18))
+                .finish_recovery_distribution(policy_id, recipient),
+        )
+    }
+
+    #[private]
+    pub fn finish_recovery_distribution(
+        &mut self,
+        policy_id: u32,
+        recipient: RecoveryRecipient,
+    ) -> bool {
+        let success = env::promise_result_checked(0, 0).is_ok();
+        self.claim_recoveries
+            .get_mut(&policy_id)
+            .expect("No claim recovery")
+            .finish_distribution(recipient, success);
+        success
+    }
+
     pub fn pay_claim(&mut self, policy_id: u32) -> Promise {
         let policy = self.policy.as_mut().expect("No policy");
         assert!(
             policy.id == policy_id && matches!(policy.phase, Phase::Approved | Phase::Paying),
             "Claim is not payable"
         );
+        assert!(!self.payout_attempt_pending, "Payout attempt pending");
+        self.payout_attempt_pending = true;
         policy.phase = Phase::Paying;
         let amount = policy.payout;
         self.pool_call(
@@ -1053,7 +1205,7 @@ impl CoverageVault {
         )
         .then(
             Self::ext(env::current_account_id())
-                .with_static_gas(Gas::from_tgas(14))
+                .with_static_gas(Gas::from_tgas(22))
                 .finish_payout(policy_id),
         )
     }
@@ -1068,11 +1220,19 @@ impl CoverageVault {
         if policy.id != policy_id {
             return false;
         }
-        if policy.phase == Phase::Paid {
-            return true;
+        if policy.phase != Phase::Paying || !self.payout_attempt_pending {
+            return policy.phase == Phase::Paid;
         }
+        self.payout_attempt_pending = false;
         match result {
             Ok(Payment::Paid) => {
+                let mut recovery = self
+                    .claim_recoveries
+                    .get(&policy_id)
+                    .cloned()
+                    .unwrap_or_default();
+                recovery.settle(policy.loss, policy.payout);
+                self.claim_recoveries.insert(policy_id, recovery);
                 policy.phase = Phase::Paid;
                 true
             }

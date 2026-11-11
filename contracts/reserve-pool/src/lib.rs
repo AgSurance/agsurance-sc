@@ -1,6 +1,9 @@
 use near_sdk::store::LookupMap;
 use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue};
 
+mod capital;
+use capital::CapitalPilot;
+
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const LIMIT: NearToken = NearToken::from_millinear(400);
 
@@ -38,6 +41,8 @@ pub struct ReservePool {
     locked: NearToken,
     pending: NearToken,
     quarantined: NearToken,
+    capital: Option<CapitalPilot>,
+    open_premium_accounts: u32,
 }
 
 #[near]
@@ -53,6 +58,8 @@ impl ReservePool {
             locked: ZERO,
             pending: ZERO,
             quarantined: ZERO,
+            capital: None,
+            open_premium_accounts: 0,
         }
     }
 
@@ -60,7 +67,13 @@ impl ReservePool {
         ReserveStatus {
             assets: self.assets,
             locked: self.locked,
-            available: self.assets.checked_sub(self.locked).unwrap_or(ZERO),
+            available: self
+                .assets
+                .checked_sub(self.locked)
+                .and_then(|amount| {
+                    amount.checked_sub(self.capital.as_ref().map_or(ZERO, CapitalPilot::buffer))
+                })
+                .unwrap_or(ZERO),
             shortfall: self.locked.checked_sub(self.assets).unwrap_or(ZERO),
             pending: self.pending,
             quarantined: self.quarantined,
@@ -88,6 +101,13 @@ impl ReservePool {
 
     #[payable]
     pub fn fund_reserve(&mut self) {
+        if self
+            .capital
+            .as_mut()
+            .is_some_and(|pilot| pilot.add_closed_principal(env::attached_deposit()))
+        {
+            return;
+        }
         self.assets = self
             .assets
             .checked_add(env::attached_deposit())
@@ -119,15 +139,30 @@ impl ReservePool {
             return matches!(allocation, Allocation::Reserved);
         }
         let locked = self.locked.checked_add(LIMIT).expect("Allocation overflow");
-        if locked > self.assets {
+        let buffer = self.capital.as_ref().map_or(ZERO, CapitalPilot::buffer);
+        if self
+            .capital
+            .as_ref()
+            .is_some_and(|pilot| !pilot.can_issue())
+            || locked.checked_add(buffer).expect("Allocation overflow") > self.assets
+        {
             return false;
         }
         self.allocations.insert(key, Allocation::Reserved);
         self.locked = locked;
+        if self.capital.is_some() {
+            self.open_premium_accounts += 1;
+        }
         true
     }
 
     pub fn release_failed_checkout(&mut self, policy_id: u32) {
+        let key = (env::predecessor_account_id(), policy_id);
+        if self.capital.is_some()
+            && matches!(self.allocations.get(&key), Some(Allocation::Reserved))
+        {
+            self.open_premium_accounts -= 1;
+        }
         self.release_closed_policy(policy_id);
     }
 
@@ -167,7 +202,12 @@ impl ReservePool {
             }
             Allocation::Reserved => {}
         }
-        assert!(amount > ZERO && amount <= LIMIT, "Invalid payout amount");
+        assert!(amount <= LIMIT, "Invalid payout amount");
+        if amount.is_zero() {
+            self.allocations.insert(key, Allocation::Paid(ZERO));
+            self.locked = self.locked.checked_sub(LIMIT).expect("Missing allocation");
+            return PromiseOrValue::Value(Payment::Paid);
+        }
         if self.assets < self.locked {
             return PromiseOrValue::Value(Payment::Retry);
         }
@@ -201,6 +241,9 @@ impl ReservePool {
         self.allocations.insert(key, Allocation::Paid(amount));
         self.locked = self.locked.checked_sub(LIMIT).expect("Missing allocation");
         self.assets = self.assets.checked_sub(amount).expect("Missing assets");
+        if let Some(pilot) = &mut self.capital {
+            pilot.record_claim_payout(amount);
+        }
         Payment::Paid
     }
 
