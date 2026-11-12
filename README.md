@@ -2,7 +2,7 @@
 
 AgSurance runs on NEAR testnet. The wallet holds the agent's spending funds, the vault manages coverage and claims, and the reserve holds the capital for approved payouts. The public demo uses a factory to deploy a wallet and vault for each buyer.
 
-[Try the live shared-reserve demo](https://agsurance-judge-preview.vercel.app/demo#manual-demo) · [0.18 NEAR payout](https://testnet.nearblocks.io/txns/7bNezR6hT22Bm2MCeSPc59BC2ehBaYSExTQdqn98MRYP/receipts) · [Run the local demo](https://github.com/AgSurance/agsurance-fe#run-the-testnet-demo) · [Open the public replay](https://agsurance.github.io/agsurance-fe/)
+[Open the live demo](https://agsurance.vercel.app/demo) · [Connect Wallet on testnet](https://agsurance.vercel.app/demo#manual-demo) · [0.25 NEAR CLI replay](https://agsurance.vercel.app/demo#cli-run) · [0.18 NEAR payout](https://testnet.nearblocks.io/txns/7bNezR6hT22Bm2MCeSPc59BC2ehBaYSExTQdqn98MRYP/receipts) · [Run the local demo](https://github.com/AgSurance/agsurance-fe#run-the-testnet-demo) · [Open the public replay](https://agsurance.github.io/agsurance-fe/)
 
 A second capital deposit opened capacity for a previously blocked checkout. The first policy kept its 0.18 NEAR limit until the owner raised it to 0.42 NEAR. The reserve paid 0.18 NEAR for a covered loss that occurred before the increase. [Capital deposit](https://testnet.nearblocks.io/txns/81QPfbkG2uhDAKc5HL4NhUCqMJijAd1wkHqdfoGQQ49U/receipts) · [Limit increase](https://testnet.nearblocks.io/txns/CL3ko61db2p4Mw2tZaLEaj9hPWLaXZpW3tipt7CyrkNV/receipts) · [0.18 NEAR payout](https://testnet.nearblocks.io/txns/7bNezR6hT22Bm2MCeSPc59BC2ehBaYSExTQdqn98MRYP/receipts)
 
